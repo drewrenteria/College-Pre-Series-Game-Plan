@@ -1,0 +1,18 @@
+# Cached ESPN and NCAA pulls. Large, regenerable on demand, and not
+# mine to redistribute.
+cache/
+
+# Knitted output. The published example is index.html at the repo root
+# so GitHub Pages can serve it; every other build artifact stays local.
+*.html
+!index.html
+*_files/
+*.knit.md
+*.utf8.md
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj

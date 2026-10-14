@@ -1,1 +1,5520 @@
+---
+title: "Opponent Advance Report"
+output:
+  html_document:
+    self_contained: true
+    theme: null
+    highlight: null
+    toc: false
+    section_divs: false
+    mathjax: null
+---
 
+```{r setup, include=FALSE}
+# ============================================================
+# NCAA OPPONENT ADVANCE REPORT
+# ONE-FILE R MARKDOWN BUILD  ·  v2
+# ============================================================
+#
+# WEEK-TO-WEEK WORKFLOW
+# 1. Change TEAM_QUERY and SEASON below.
+# 2. Leave REFRESH_DATA = FALSE for cached/repeat renders.
+# 3. Set REFRESH_DATA = TRUE once when you want fresh data.
+# 4. Click Knit.  Output is a single self-contained .html file
+#    that can be emailed or posted as-is.
+#
+# WHAT CHANGED IN v2 (see the Data Quality tab in the report)
+# - Season rate stats now come from the official NCAA source.
+#   ESPN box scores are used only for the recent-game window.
+#   The two are reconciled and disagreements are reported.
+# - Every table states its source and its sample window.
+# - Games that failed to download are counted and disclosed
+#   instead of silently shrinking the sample.
+# - Play-by-play events are attributed to the player who did
+#   them, not to every name that appears in the sentence.
+# ============================================================
+
+
+# ============================================================
+# 1. SETTINGS - THIS IS THE MAIN SECTION YOU CHANGE
+# ============================================================
+
+TEAM_QUERY <- "UCLA"
+SEASON     <- 2026
+
+# Most recent completed games used for the detailed
+# player / lineup / pitching / bullpen / tendency analysis.
+DETAIL_GAMES <- 20
+
+# Recent-form comparison window.
+RECENT_GAMES <- 10
+
+# FALSE = use files already stored in cache/
+# TRUE  = force the report to refresh its source data.
+REFRESH_DATA <- FALSE
+
+# Pull official NCAA season stats as a second source and
+# reconcile them against ESPN.
+#
+# stats.ncaa.org is slow and throttles aggressively. This layer
+# is time-boxed so it can never stall a knit: if it does not
+# finish inside the budget below the report renders anyway and
+# says so on the Data Quality tab. Once it succeeds it is cached
+# and later knits are instant.
+#
+# Set USE_NCAA <- FALSE to skip it entirely.
+USE_NCAA            <- TRUE
+NCAA_DIVISION       <- 1
+# Optional: paste a stats.ncaa.org team id here to skip lookup
+# entirely. Find it in the URL of the team's stats page. Leave NA
+# to let the report resolve it.
+NCAA_TEAM_ID <- NA_character_
+
+NCAA_TIMEOUT_SECONDS <- 60   # cap on any single NCAA request
+NCAA_BUDGET_SECONDS  <- 180  # cap on the whole NCAA section
+
+# Scraping the full Division I index off stats.ncaa.org takes
+# minutes and is the only step here that can hang. It is OFF by
+# default: the report resolves the team from tables bundled with
+# baseballr instead, and if those miss it tells you to paste an id
+# rather than spending three minutes discovering it cannot.
+NCAA_ALLOW_INDEX_SCRAPE <- FALSE
+
+# Network timeout for ESPN requests.
+NET_TIMEOUT_SECONDS <- 120
+
+# Minimum sample before a player appears in a ranked table.
+# Anyone under the line still shows, in a separate
+# "limited sample" table, so nobody silently disappears.
+MIN_AB_WINDOW  <- 10   # hitters, at-bats in the window
+MIN_OUT_WINDOW <- 9    # pitchers, outs recorded (9 outs = 3.0 IP)
+MIN_PA_SEASON  <- 40   # hitters, season plate appearances
+
+# ---- Top-three lists on the Game Plan tab -------------------
+# Two separate lists, not one blended one. The season list answers
+# "who are their best players"; the recent list answers "who is
+# swinging it right now". Mixing those into a single ranking hides
+# both answers.
+RECENT_PERF_GAMES <- 5    # window for the recent-performers section
+MIN_AB_RECENT     <- 6    # hitters, at-bats over that window
+MIN_OUT_RECENT    <- 6    # pitchers, outs recorded (6 outs = 2.0 IP)
+
+# Pitchers have to have thrown enough to be judged on rate stats.
+# Expressed per team game, like the official NCAA ERA qualifier
+# (1.0 IP per team game). Half of that keeps late-inning relievers
+# eligible without letting a four-inning cameo lead the staff.
+PITCHER_QUAL_IP_PER_GAME <- 0.50
+PITCHER_QUAL_IP_FLOOR    <- 10
+
+# Rule-of-thumb flag thresholds. These are scouting
+# conventions, NOT league percentiles - the report labels
+# them that way. Tune them here in one place.
+THRESHOLDS <- list(
+  hr_per_game        = 1.10,
+  free_bases_per_game = 4.50,
+  sb_per_game        = 1.00,
+  sac_per_game       = 0.45,
+  k_per_game         = 9.00,
+  staff_k9_good      = 9.00,
+  staff_k9_soft      = 7.50,
+  staff_bb9_good     = 3.00,
+  staff_bb9_loose    = 4.00,
+  staff_whip_good    = 1.20,
+  staff_whip_loose   = 1.45,
+  percentile_high    = 80,
+  percentile_elite   = 90,
+  form_swing         = 0.15
+)
+
+
+# ============================================================
+# 2. PACKAGES
+# ============================================================
+
+required_packages <- c(
+  "baseballr", "dplyr", "tidyr", "purrr", "stringr", "tibble",
+  "janitor", "lubridate", "scales", "knitr", "rmarkdown",
+  "htmltools", "base64enc", "jsonlite"
+)
+
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, dependencies = TRUE)
+}
+
+invisible(lapply(required_packages, function(pkg) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}))
+
+options(timeout = NET_TIMEOUT_SECONDS, scipen = 999)
+
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  fig.align = "center", dpi = 120
+)
+
+if (utils::packageVersion("baseballr") < "2.0.0") {
+  stop(
+    "This report requires baseballr 2.0.0 or newer. ",
+    "Run install.packages('baseballr') and try again.",
+    call. = FALSE
+  )
+}
+
+# This report writes styled HTML directly - a hero band, tab bar,
+# card grids and inline CSS. Routed through LaTeX none of that
+# survives, and pandoc dies on the raw HTML long before you get a
+# page. RStudio's "Knit to PDF" button does exactly that, so catch
+# it here and say what to do instead of surfacing a LaTeX error.
+.output_format <- knitr::opts_knit$get("rmarkdown.pandoc.to")
+if (!is.null(.output_format) &&
+    !.output_format %in% c("html", "html4", "html5")) {
+  stop(
+    "This report builds a self-contained HTML page and cannot be knit to ",
+    .output_format, ".\n\n",
+    "Use the Knit button's default (Knit to HTML), or press Ctrl+Shift+K.\n\n",
+    "For a PDF: knit to HTML, open the .html file in Chrome or Edge, press ",
+    "Ctrl+P and choose 'Save as PDF'. Turn ON 'Background graphics' in the ",
+    "print dialog or the team colours will print white. Every tab is expanded ",
+    "automatically when printing, so the PDF contains the whole report.",
+    call. = FALSE
+  )
+}
+
+CACHE_DIR <- "cache"
+dir.create(CACHE_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r helpers}
+# ============================================================
+# 3. SMALL HELPERS
+# ============================================================
+
+`%||%` <- function(x, y) {
+  if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x
+}
+
+as_num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+safe_first <- function(x, default = NA_character_) {
+  if (is.null(x) || length(x) == 0) return(default)
+  x <- as.character(x)
+  x <- x[!is.na(x) & nzchar(x)]
+  if (length(x) == 0) default else x[[1]]
+}
+
+last_non_na <- function(x, default = NA_real_) {
+  idx <- which(!is.na(x))
+  if (length(idx) == 0) default else x[[idx[length(idx)]]]
+}
+
+n_rows <- function(x) {
+  if (is.null(x)) return(0L)
+  if (is.data.frame(x)) return(nrow(x))
+  length(x)
+}
+
+slugify <- function(x) {
+  x |>
+    stringr::str_to_lower() |>
+    stringr::str_replace_all("[^a-z0-9]+", "_") |>
+    stringr::str_replace_all("^_|_$", "")
+}
+
+normalize_team_name <- function(x) {
+  x |>
+    as.character() |>
+    stringr::str_to_lower() |>
+    stringr::str_replace_all("[^a-z0-9]", "")
+}
+
+# Display name for tables. ESPN sends the same player under more
+# than one spelling across games - "Ethan Hawk" in one box score
+# and "Ethan P Hawk" in the next - which reads as two players.
+# Interior single-letter initials are dropped, but only when the
+# first name is a real name: "J.T. Realmuto" and "A.J. Vukovich"
+# are left alone, because there the initials ARE the name.
+tidy_display_name <- function(x) {
+  x <- stringr::str_squish(as.character(x))
+  vapply(x, function(one) {
+    if (is.na(one) || !nzchar(one)) return(NA_character_)
+    tok <- strsplit(one, "\\s+")[[1]]
+    if (length(tok) < 3) return(paste(tok, collapse = " "))
+    bare <- gsub("[.]", "", tok)
+    if (nchar(bare[[1]]) <= 1) return(paste(tok, collapse = " "))
+    keep <- rep(TRUE, length(tok))
+    interior <- setdiff(seq_along(tok), c(1L, length(tok)))
+    keep[interior] <- nchar(bare[interior]) > 1
+    paste(tok[keep], collapse = " ")
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# Order-insensitive player key. Handles "Smith, John" vs
+# "John Smith", accents, punctuation, middle initials and
+# generational suffixes, so ESPN and NCAA names can be joined.
+norm_person_key <- function(x) {
+  x <- as.character(x)
+  x <- iconv(x, from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+  x <- stringr::str_to_lower(x)
+  x <- stringr::str_replace_all(x, "[^a-z ]", " ")
+  x <- stringr::str_squish(x)
+  vapply(stringr::str_split(x, " "), function(tok) {
+    tok <- tok[nchar(tok) > 1]
+    tok <- tok[!tok %in% c("jr", "sr", "ii", "iii", "iv")]
+    if (length(tok) == 0) NA_character_ else paste(sort(tok), collapse = "_")
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# Innings pitched are base-3, not base-10. Doing the math in
+# outs is the only way to avoid producing "4.3 IP".
+ip_to_outs <- function(x) {
+  n     <- as_num(x)
+  whole <- floor(n)
+  frac  <- round((n - whole) * 10)
+  frac[is.na(frac) | !frac %in% c(0, 1, 2)] <- 0
+  out <- whole * 3 + frac
+  out[is.na(n)] <- NA_real_
+  out
+}
+
+outs_to_ip_chr <- function(outs) {
+  ifelse(is.na(outs), NA_character_, paste0(outs %/% 3, ".", outs %% 3))
+}
+
+outs_to_ip_num <- function(outs) outs / 3
+
+# Percentile rank inside a group, NA-safe. Used to put a season
+# stat and a recent stat on the same 0-1 scale so they can be
+# blended without inventing a composite metric.
+rank_pct <- function(x) {
+  out <- rep(NA_real_, length(x))
+  ok  <- is.finite(x)
+  n   <- sum(ok)
+  if (n == 0) return(out)
+  if (n == 1) {
+    out[ok] <- 1
+    return(out)
+  }
+  out[ok] <- (rank(x[ok], ties.method = "average") - 1) / (n - 1)
+  out
+}
+
+rate_per <- function(numerator, denominator, per = 1) {
+  ifelse(
+    is.na(denominator) | denominator <= 0,
+    NA_real_,
+    numerator / denominator * per
+  )
+}
+
+fmt <- function(x, digits = 2, blank = "—") {
+  ifelse(is.na(x) | !is.finite(x), blank, sprintf(paste0("%.", digits, "f"), x))
+}
+
+fmt_avg <- function(x, blank = "—") {
+  ifelse(
+    is.na(x) | !is.finite(x),
+    blank,
+    sub("^0", "", sprintf("%.3f", x))
+  )
+}
+
+fmt_pct <- function(x, digits = 0, blank = "—") {
+  ifelse(
+    is.na(x) | !is.finite(x),
+    blank,
+    paste0(sprintf(paste0("%.", digits, "f"), 100 * x), "%")
+  )
+}
+
+fmt_int <- function(x, blank = "—") {
+  ifelse(is.na(x) | !is.finite(x), blank, format(round(as_num(x)), trim = TRUE))
+}
+
+fmt_chr <- function(x, blank = "—") {
+  x <- as.character(x)
+  ifelse(is.na(x) | !nzchar(x) | x == "NA", blank, x)
+}
+
+# A column that is entirely empty is noise. Printing a wall of NA
+# makes a degraded report look like a broken one.
+drop_empty_cols <- function(df, keep = character()) {
+  if (is.null(df) || ncol(df) == 0) return(df)
+  keep_col <- vapply(names(df), function(nm) {
+    if (nm %in% keep) return(TRUE)
+    vals <- as.character(df[[nm]])
+    any(!is.na(vals) & nzchar(vals) & !vals %in% c("—", "NA"))
+  }, logical(1))
+  df[, keep_col, drop = FALSE]
+}
+
+fmt_signed <- function(x, digits = 2, blank = "—") {
+  ifelse(is.na(x) | !is.finite(x), blank, sprintf(paste0("%+.", digits, "f"), x))
+}
+
+# knitr captures message() output, so progress written that way never
+# reaches the console during a knit. Writing straight to stderr does.
+progress <- function(...) {
+  cat(paste0(..., collapse = ""), "\n", sep = "", file = stderr())
+  utils::flush.console()
+}
+
+html_escape <- function(x) as.character(htmltools::htmlEscape(as.character(x)))
+
+# Box-score fields arrive as character after harmonization. ESPN sends
+# dates as either "2026-04-10" or a full timestamp, and booleans as
+# either "TRUE"/"FALSE" or "1"/"0", so both are parsed tolerantly
+# rather than assumed.
+as_date_safe <- function(x) {
+  suppressWarnings(as.Date(substr(as.character(x), 1, 10)))
+}
+
+as_lgl <- function(x) {
+  x <- stringr::str_to_lower(stringr::str_trim(as.character(x)))
+  dplyr::case_when(
+    x %in% c("true", "t", "1", "yes")  ~ TRUE,
+    x %in% c("false", "f", "0", "no")  ~ FALSE,
+    TRUE ~ NA
+  )
+}
+
+clean_hex <- function(x, fallback = "17324D") {
+  x <- gsub("#", "", safe_first(x, fallback))
+  if (!grepl("^[0-9A-Fa-f]{6}$", x)) fallback else toupper(x)
+}
+
+hex_luminance <- function(hex) {
+  rgb  <- grDevices::col2rgb(paste0("#", clean_hex(hex))) / 255
+  vals <- ifelse(rgb <= 0.03928, rgb / 12.92, ((rgb + 0.055) / 1.055)^2.4)
+  0.2126 * vals[1] + 0.7152 * vals[2] + 0.0722 * vals[3]
+}
+
+contrast_text <- function(hex) if (hex_luminance(hex) > 0.55) "#101820" else "#FFFFFF"
+
+# Find the first column that exists from a list of candidates.
+# ESPN and NCAA both rename columns between seasons; this keeps
+# a rename from silently turning a real number into NA.
+pick_col <- function(df, candidates) {
+  if (is.null(df) || nrow(df) == 0) return(NA_character_)
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) == 0) NA_character_ else hit[[1]]
+}
+
+col_or_na <- function(df, candidates, numeric = TRUE) {
+  nm <- pick_col(df, candidates)
+  if (is.na(nm)) {
+    return(rep(if (numeric) NA_real_ else NA_character_, nrow(df)))
+  }
+  if (numeric) as_num(df[[nm]]) else as.character(df[[nm]])
+}
+```
+
+```{r data_log_and_cache}
+# ============================================================
+# 4. PROVENANCE LOG + CACHE
+# ============================================================
+# Every pull is recorded: where it came from, whether it was
+# fresh or cached, when it was fetched, and whether it failed.
+# The Data Quality tab prints this. A report that quietly
+# renders on half its data is the thing to design against.
+
+AR_STATE <- new.env(parent = emptyenv())
+AR_STATE$pulls  <- list()
+AR_STATE$checks <- list()
+
+log_pull <- function(source, key, status, fetched_at = Sys.time(),
+                     rows = NA_integer_, note = "") {
+  AR_STATE$pulls[[length(AR_STATE$pulls) + 1]] <- tibble::tibble(
+    Source    = source,
+    Item      = key,
+    Status    = status,
+    Retrieved = as.POSIXct(fetched_at),
+    Rows      = as.integer(rows),
+    Note      = note
+  )
+  invisible(NULL)
+}
+
+log_check <- function(check, result, detail = "") {
+  AR_STATE$checks[[length(AR_STATE$checks) + 1]] <- tibble::tibble(
+    Check  = check,
+    Result = result,
+    Detail = detail
+  )
+  invisible(NULL)
+}
+
+pull_log <- function() {
+  if (length(AR_STATE$pulls) == 0) return(tibble::tibble())
+  dplyr::bind_rows(AR_STATE$pulls)
+}
+
+check_log <- function() {
+  if (length(AR_STATE$checks) == 0) return(tibble::tibble())
+  dplyr::bind_rows(AR_STATE$checks)
+}
+
+# Cache keys are versioned so a schema change here can never
+# be served a stale object written by an older build.
+CACHE_VERSION <- "v2"
+
+cache_path <- function(...) {
+  pieces <- vapply(unlist(list(...)), as.character, character(1))
+  file.path(
+    CACHE_DIR,
+    paste0(CACHE_VERSION, "_", paste(pieces, collapse = "_"), ".rds")
+  )
+}
+
+# A cached answer that later proves wrong has to be removable, or
+# one bad resolution outlives every future render.
+cache_peek <- function(key) {
+  path <- cache_path(key)
+  if (!file.exists(path)) return(NULL)
+  wrapped <- tryCatch(readRDS(path), error = function(e) NULL)
+  if (is.list(wrapped) && isTRUE(wrapped$.ar_cache)) wrapped$data else NULL
+}
+
+cache_poke <- function(key, value) {
+  try(
+    saveRDS(list(.ar_cache = TRUE, fetched_at = Sys.time(), data = value),
+            cache_path(key)),
+    silent = TRUE
+  )
+  invisible(NULL)
+}
+
+cache_forget <- function(key) {
+  path <- cache_path(key)
+  if (file.exists(path)) try(file.remove(path), silent = TRUE)
+  invisible(NULL)
+}
+
+with_retry <- function(fn, tries = 3, pause = 1.5) {
+  for (attempt in seq_len(tries)) {
+    result <- try(fn(), silent = TRUE)
+    if (!inherits(result, "try-error")) return(result)
+    if (attempt < tries) Sys.sleep(pause * attempt)
+  }
+  stop(attr(result, "condition")$message %||% "request failed", call. = FALSE)
+}
+
+# Retries multiply the timeout. Three attempts against a 600
+# second timeout is a possible thirty-minute stall on one call,
+# which is exactly how a render hangs. Slow sources get one
+# attempt and a short clock.
+with_timeout <- function(fn, seconds) {
+  if (is.null(seconds)) return(fn())
+  old <- getOption("timeout")
+  options(timeout = seconds)
+  on.exit(options(timeout = old), add = TRUE)
+  fn()
+}
+
+cache_get <- function(key, pull_fn, refresh = FALSE, fallback = NULL,
+                      source = "ESPN", label = NULL, retry = TRUE,
+                      tries = 3, timeout_seconds = NULL) {
+  label <- label %||% paste(key, collapse = " ")
+  path  <- cache_path(key)
+
+  if (!refresh && file.exists(path)) {
+    wrapped <- tryCatch(readRDS(path), error = function(e) NULL)
+    if (is.list(wrapped) && isTRUE(wrapped$.ar_cache)) {
+      log_pull(source, label, "cached", wrapped$fetched_at, n_rows(wrapped$data))
+      return(wrapped$data)
+    }
+  }
+
+  runner <- if (retry && tries > 1) {
+    function() with_retry(pull_fn, tries = tries)
+  } else {
+    pull_fn
+  }
+  result <- tryCatch(with_timeout(runner, timeout_seconds), error = function(e) {
+    log_pull(source, label, "FAILED", Sys.time(), NA_integer_, conditionMessage(e))
+    NULL
+  })
+
+  # Failures are never written to cache, so a bad network day
+  # does not become a permanently poisoned cache file.
+  if (is.null(result)) return(fallback)
+
+  try(
+    saveRDS(
+      list(.ar_cache = TRUE, fetched_at = Sys.time(), data = result),
+      path
+    ),
+    silent = TRUE
+  )
+  log_pull(source, label, "fresh", Sys.time(), n_rows(result))
+  result
+}
+
+# Binding many ESPN games together fails when a column is
+# character in one game and all-NA logical in another. Coercing
+# to character first makes the bind deterministic; the columns
+# we actually use are typed explicitly downstream.
+harmonize_chr <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
+  df <- as.data.frame(df, stringsAsFactors = FALSE)
+  df[] <- lapply(df, function(col) {
+    if (is.list(col)) {
+      vapply(col, function(z) paste(unlist(z), collapse = "|"), character(1))
+    } else {
+      as.character(col)
+    }
+  })
+  tibble::as_tibble(df)
+}
+
+bind_game_component <- function(bundles, component) {
+  parts <- lapply(names(bundles), function(game_id) {
+    bundle <- bundles[[game_id]]
+    if (is.null(bundle) || !is.list(bundle) || is.null(names(bundle))) {
+      return(NULL)
+    }
+    idx <- which(tolower(names(bundle)) == tolower(component))
+    if (length(idx) == 0) return(NULL)
+    x <- bundle[[idx[[1]]]]
+    if (is.null(x) || nrow(x) == 0) return(NULL)
+    x <- harmonize_chr(x)
+    if (!"game_id" %in% names(x)) x$game_id <- game_id
+    x
+  })
+  parts <- parts[!vapply(parts, is.null, logical(1))]
+  if (length(parts) == 0) return(tibble::tibble())
+  dplyr::bind_rows(parts)
+}
+```
+
+```{r team_lookup}
+# ============================================================
+# 5. TEAM LOOKUP + LOGO
+# ============================================================
+
+resolve_team <- function(query, teams) {
+  teams <- janitor::clean_names(teams)
+  q     <- normalize_team_name(query)
+
+  name_cols <- intersect(
+    c("abbreviation", "display_name", "team", "short_name", "location", "name"),
+    names(teams)
+  )
+  if (length(name_cols) == 0) {
+    stop("Could not identify team-name columns in the ESPN team table.", call. = FALSE)
+  }
+
+  exact <- rep(FALSE, nrow(teams))
+  for (nm in name_cols) {
+    exact <- exact | normalize_team_name(teams[[nm]]) == q
+  }
+  if (any(exact)) return(teams[which(exact)[1], , drop = FALSE])
+
+  blob <- apply(teams[, name_cols, drop = FALSE], 1, function(z) {
+    normalize_team_name(paste(z, collapse = " "))
+  })
+  hits <- which(stringr::str_detect(blob, stringr::fixed(q)))
+
+  if (length(hits) == 0) {
+    stop(
+      "Could not find a college baseball team matching '", query,
+      "'. Try a school name or abbreviation such as UCLA, USC, Oregon.",
+      call. = FALSE
+    )
+  }
+  if (length(hits) > 1) {
+    log_check(
+      "Team name match",
+      "AMBIGUOUS",
+      paste0(
+        "'", query, "' matched ", length(hits), " teams; used ",
+        safe_first(teams$display_name[hits[1]], "the first match"), "."
+      )
+    )
+  }
+  teams[hits[1], , drop = FALSE]
+}
+
+cache_logo <- function(url, team_slug, refresh = FALSE) {
+  if (is.na(url) || !nzchar(url)) return(NA_character_)
+  path <- file.path(CACHE_DIR, paste0(team_slug, "_logo.png"))
+  if (!refresh && file.exists(path)) return(path)
+
+  ok <- tryCatch({
+    utils::download.file(url, path, mode = "wb", quiet = TRUE, method = "libcurl")
+    TRUE
+  }, error = function(e) FALSE, warning = function(w) FALSE)
+
+  if (!ok || !file.exists(path)) NA_character_ else path
+}
+
+file_to_data_uri <- function(path) {
+  if (is.na(path) || !file.exists(path)) return(NA_character_)
+  paste0("data:image/png;base64,", base64enc::base64encode(path))
+}
+```
+
+```{r espn_schedule}
+# ============================================================
+# 6. ESPN SCHEDULE
+# ============================================================
+
+pull_team_schedule <- function(team_id, season, refresh = FALSE) {
+
+  parse_score <- function(x) {
+    if (is.null(x)) return(NA_real_)
+    if (is.atomic(x)) return(as_num(x[[1]]))
+    if (is.list(x)) {
+      for (nm in c("value", "displayValue", "display_value")) {
+        if (!is.null(x[[nm]])) {
+          value <- as_num(x[[nm]][[1]])
+          if (!is.na(value)) return(value)
+        }
+      }
+    }
+    NA_real_
+  }
+
+  scalar_chr <- function(x, default = NA_character_) {
+    if (is.null(x) || length(x) == 0) return(default)
+    value <- tryCatch(as.character(x[[1]]), error = function(e) default)
+    if (length(value) == 0 || is.na(value) || !nzchar(value)) default else value
+  }
+
+  scalar_lgl <- function(x, default = NA) {
+    if (is.null(x) || length(x) == 0) return(default)
+    value <- tryCatch(as.logical(x[[1]]), error = function(e) default)
+    if (length(value) == 0) default else value
+  }
+
+  fetch_schedule_type <- function(season_type) {
+    cache_get(
+      c("espn_schedule", team_id, season, season_type),
+      function() {
+        url <- paste0(
+          "https://site.api.espn.com/apis/site/v2/sports/baseball/",
+          "college-baseball/teams/", team_id,
+          "/schedule?season=", season, "&seasontype=", season_type
+        )
+        raw    <- jsonlite::fromJSON(url, simplifyVector = FALSE)
+        events <- raw$events %||% list()
+        if (length(events) == 0) return(tibble::tibble())
+
+        purrr::map_dfr(events, function(ev) {
+          competition <- tryCatch(ev$competitions[[1]], error = function(e) NULL)
+          if (is.null(competition)) return(tibble::tibble())
+
+          competitors <- competition$competitors %||% list()
+          if (length(competitors) < 2) return(tibble::tibble())
+
+          ids <- vapply(competitors, function(comp) {
+            scalar_chr(comp$id %||% comp$team$id %||% NA_character_)
+          }, character(1))
+
+          focal_index <- which(ids == as.character(team_id))
+          if (length(focal_index) == 0) {
+            team_ids <- vapply(competitors, function(comp) {
+              scalar_chr(comp$team$id %||% NA_character_)
+            }, character(1))
+            focal_index <- which(team_ids == as.character(team_id))
+          }
+          if (length(focal_index) == 0) return(tibble::tibble())
+
+          focal_index    <- focal_index[[1]]
+          opponent_index <- setdiff(seq_along(competitors), focal_index)[[1]]
+          focal          <- competitors[[focal_index]]
+          opponent       <- competitors[[opponent_index]]
+
+          team_score_num     <- parse_score(focal$score)
+          opponent_score_num <- parse_score(opponent$score)
+
+          status_completed <- scalar_lgl(
+            competition$status$type$completed %||% ev$status$type$completed %||% NA
+          )
+          status_description <- scalar_chr(
+            competition$status$type$description %||%
+              ev$status$type$description %||% NA_character_
+          )
+          winner_from_feed <- scalar_lgl(focal$winner %||% NA)
+
+          winner_clean <- dplyr::case_when(
+            !is.na(team_score_num) & !is.na(opponent_score_num) &
+              team_score_num > opponent_score_num ~ TRUE,
+            !is.na(team_score_num) & !is.na(opponent_score_num) &
+              team_score_num < opponent_score_num ~ FALSE,
+            !is.na(winner_from_feed) ~ winner_from_feed,
+            TRUE ~ NA
+          )
+
+          completed <- dplyr::case_when(
+            !is.na(team_score_num) & !is.na(opponent_score_num) ~ TRUE,
+            isTRUE(status_completed) ~ TRUE,
+            stringr::str_detect(
+              stringr::str_to_lower(status_description %||% ""),
+              "final|completed"
+            ) ~ TRUE,
+            TRUE ~ FALSE
+          )
+
+          opponent_name <- scalar_chr(
+            opponent$team$displayName %||% opponent$team$shortDisplayName %||%
+              opponent$team$name %||% NA_character_
+          )
+          opponent_abbrev <- scalar_chr(opponent$team$abbreviation %||% NA_character_)
+          game_date_raw   <- scalar_chr(ev$date %||% NA_character_)
+
+          tibble::tibble(
+            event_id      = scalar_chr(ev$id %||% NA_character_),
+            season        = suppressWarnings(as.integer(
+              scalar_chr(ev$season$year %||% season)
+            )),
+            season_type   = season_type,
+            game_datetime = suppressWarnings(
+              as.POSIXct(game_date_raw, format = "%Y-%m-%dT%H:%MZ", tz = "UTC")
+            ),
+            game_date     = suppressWarnings(as.Date(substr(game_date_raw, 1, 10))),
+            name          = scalar_chr(ev$name %||% NA_character_),
+            opponent_id   = scalar_chr(
+              opponent$id %||% opponent$team$id %||% NA_character_
+            ),
+            opponent_name   = opponent_name,
+            opponent_abbrev = opponent_abbrev,
+            opponent_label  = dplyr::coalesce(opponent_abbrev, opponent_name),
+            home_away       = scalar_chr(focal$homeAway %||% NA_character_),
+            neutral_site    = scalar_lgl(competition$neutralSite %||% FALSE, FALSE),
+            conference_competition = scalar_lgl(
+              competition$conferenceCompetition %||% FALSE, FALSE
+            ),
+            venue_name  = scalar_chr(competition$venue$fullName %||% NA_character_),
+            result      = status_description,
+            team_score_num     = team_score_num,
+            opponent_score_num = opponent_score_num,
+            winner_clean = winner_clean,
+            completed    = completed
+          )
+        })
+      },
+      refresh = refresh,
+      fallback = tibble::tibble(),
+      source  = "ESPN",
+      label   = paste0("schedule (season type ", season_type, ")")
+    )
+  }
+
+  dplyr::bind_rows(fetch_schedule_type(2), fetch_schedule_type(3)) |>
+    dplyr::filter(!is.na(event_id), nzchar(event_id)) |>
+    dplyr::distinct(event_id, .keep_all = TRUE) |>
+    dplyr::arrange(game_date, game_datetime)
+}
+
+# ============================================================
+# CONFERENCE MEMBERSHIP
+# ============================================================
+# ESPN's schedule feed has no conferenceCompetition field at all
+# for college baseball - it is absent, not false - so the old flag
+# could never mark a conference game. Instead the team's own
+# conference group is looked up, its member team ids are read from
+# the conference standings, and a game counts as a conference game
+# when the opponent id is in that set. Comparing ids avoids trying
+# to match "Saint Mary's Gaels" to "Saint Mary's (CA)" by name.
+
+espn_core_url <- function(...) {
+  paste0(
+    "https://sports.core.api.espn.com/v2/sports/baseball/leagues/",
+    "college-baseball/", paste0(..., collapse = "")
+  )
+}
+
+# Pure: pull the numeric team ids out of a list of $ref URLs.
+ids_from_team_refs <- function(items) {
+  if (is.null(items) || length(items) == 0) return(character())
+  out <- vapply(items, function(it) {
+    ref <- tryCatch(
+      it$team$`$ref` %||% it$`$ref` %||% NA_character_,
+      error = function(e) NA_character_
+    )
+    ref <- safe_first(ref, NA_character_)
+    if (is.na(ref)) return(NA_character_)
+    m <- stringr::str_match(ref, "/teams/([0-9]+)")[, 2]
+    if (is.na(m)) NA_character_ else m
+  }, character(1), USE.NAMES = FALSE)
+  unique(out[!is.na(out)])
+}
+
+espn_conference <- function(team_id, season, refresh = FALSE) {
+  blank <- list(id = NA_character_, name = NA_character_, members = character())
+
+  info <- cache_get(
+    c("espn_conference", team_id, season),
+    function() {
+      team_raw <- jsonlite::fromJSON(
+        paste0(
+          "https://site.api.espn.com/apis/site/v2/sports/baseball/",
+          "college-baseball/teams/", team_id
+        ),
+        simplifyVector = FALSE
+      )
+      grp <- team_raw$team$groups %||% list()
+      gid <- safe_first(grp$id %||% NA_character_, NA_character_)
+      if (!isTRUE(as.logical(grp$isConference %||% FALSE)) &&
+          !is.null(grp$parent$id)) {
+        gid <- safe_first(grp$parent$id, gid)
+      }
+      if (is.na(gid)) stop("no conference group on the team record", call. = FALSE)
+
+      grp_raw <- jsonlite::fromJSON(
+        espn_core_url("seasons/", season, "/types/2/groups/", gid),
+        simplifyVector = FALSE
+      )
+      standings_raw <- jsonlite::fromJSON(
+        espn_core_url("seasons/", season, "/types/2/groups/", gid, "/standings/0"),
+        simplifyVector = FALSE
+      )
+      entries <- standings_raw$standings %||% standings_raw$entries %||% list()
+
+      list(
+        id      = as.character(gid),
+        name    = safe_first(
+          grp_raw$shortName %||% grp_raw$name %||% NA_character_, NA_character_
+        ),
+        members = ids_from_team_refs(entries)
+      )
+    },
+    refresh = refresh,
+    fallback = NULL,
+    source  = "ESPN",
+    label   = "conference membership"
+  )
+
+  if (is.null(info)) blank else info
+}
+
+# Pure: mark conference games from a membership set, falling back to
+# whatever the feed's own flag said when membership is unavailable.
+mark_conference_games <- function(sched, member_ids, focal_id) {
+  members <- setdiff(as.character(member_ids), as.character(focal_id))
+  if (length(members) == 0) {
+    return(dplyr::mutate(
+      sched,
+      conference_game = tidyr::replace_na(conference_competition %in% TRUE, FALSE),
+      conference_source = "ESPN flag"
+    ))
+  }
+  dplyr::mutate(
+    sched,
+    conference_game = as.character(opponent_id) %in% members,
+    conference_source = "conference membership"
+  )
+}
+
+get_game_bundle <- function(game_id, refresh = FALSE) {
+  cache_get(
+    c("espn_game", game_id),
+    function() baseballr::espn_college_baseball_game_all(game_id),
+    refresh = refresh,
+    fallback = NULL,
+    source  = "ESPN",
+    label   = paste0("game ", game_id)
+  )
+}
+
+# A series is a run of games against the same opponent on
+# consecutive-ish dates. College staffs line up their rotation
+# by series slot (Friday / Saturday / Sunday), not by rest days,
+# so this is what the starter projection is built on.
+add_series_slot <- function(sched, max_gap_days = 1) {
+  if (is.null(sched) || nrow(sched) == 0) return(sched)
+  sched |>
+    dplyr::arrange(game_date, game_datetime) |>
+    dplyr::mutate(
+      .gap = as.numeric(game_date - dplyr::lag(game_date)),
+      .new_series = dplyr::coalesce(
+        opponent_id != dplyr::lag(opponent_id) | .gap > max_gap_days,
+        TRUE
+      ),
+      series_id   = cumsum(.new_series)
+    ) |>
+    dplyr::group_by(series_id) |>
+    dplyr::mutate(
+      series_len  = dplyr::n(),
+      series_slot = dplyr::row_number(),
+      slot_label  = dplyr::if_else(
+        series_len >= 3,
+        paste0("G", series_slot),
+        dplyr::if_else(series_len == 2, paste0("G", series_slot, " (2-gm)"), "Single")
+      )
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::select(-.gap, -.new_series)
+}
+```
+
+```{r ncaa_layer}
+# ============================================================
+# 7. OFFICIAL NCAA SEASON STATS (SECOND SOURCE)
+# ============================================================
+# ESPN box scores are excellent for game-level detail but they
+# do not publish doubles, triples, HBP or SF per game, which
+# means a season slash line cannot honestly be rebuilt from
+# them. stats.ncaa.org does publish those. So:
+#
+#   season rate stats  -> NCAA (official)
+#   recent-window work -> ESPN box scores
+#   spray / situational-> ESPN play-by-play
+#
+# and the two sources are reconciled rather than blended.
+
+# stats.ncaa.org requests get one attempt on a short clock. The
+# httr timeout is passed through baseballr's ... where it is
+# accepted, and quietly skipped where it is not.
+ncaa_try <- function(fn, ...) {
+  if (requireNamespace("httr", quietly = TRUE)) {
+    attempt <- try(fn(..., httr::timeout(NCAA_TIMEOUT_SECONDS)), silent = TRUE)
+    if (!inherits(attempt, "try-error")) return(attempt)
+    # Any failure here falls through to the plain call. Passing the
+    # timeout is a nicety; losing the official season stats because
+    # baseballr would not accept it is not a trade worth making.
+    progress("  NCAA: retrying without an explicit timeout...")
+  }
+  fn(...)
+}
+
+# Shared by the bundled lookup and the scraped index. Prefers the
+# requested season, falls back to the most recent season present -
+# a school's id is stable, and an id from last year is a far better
+# starting point than no id at all.
+match_ncaa_rows <- function(tbl, team_query, team_name, abbreviation,
+                            season, division) {
+  if (is.null(tbl) || nrow(tbl) == 0) return(tibble::tibble())
+  name_col <- pick_col(tbl, c("team_name", "school", "team"))
+  if (is.na(name_col)) return(tibble::tibble())
+
+  tbl$.norm <- normalize_team_name(tbl[[name_col]])
+  candidates <- unique(normalize_team_name(c(team_name, team_query, abbreviation)))
+  candidates <- candidates[nchar(candidates) > 1]
+
+  hits <- tbl[tbl$.norm %in% candidates, , drop = FALSE]
+  if (nrow(hits) == 0) {
+    for (cand in candidates) {
+      if (nchar(cand) < 3) next
+      loose <- tbl[
+        stringr::str_detect(tbl$.norm, stringr::fixed(cand)) |
+          stringr::str_detect(cand, stringr::fixed(tbl$.norm)),
+        ,
+        drop = FALSE
+      ]
+      if (nrow(loose) > 0) {
+        hits <- loose
+        break
+      }
+    }
+  }
+  if (nrow(hits) == 0) return(tibble::tibble())
+
+  if ("division" %in% names(hits)) {
+    div <- as_num(hits$division)
+    if (any(div == division, na.rm = TRUE)) {
+      hits <- hits[which(div == division), , drop = FALSE]
+    }
+  }
+  if ("year" %in% names(hits)) {
+    yr <- as_num(hits$year)
+    if (any(yr == season, na.rm = TRUE)) {
+      hits <- hits[which(yr == season), , drop = FALSE]
+    } else if (any(!is.na(yr))) {
+      hits <- hits[which(yr == max(yr, na.rm = TRUE)), , drop = FALSE]
+    }
+  }
+  hits[1, , drop = FALSE]
+}
+
+# Gather every team id worth trying, cheapest source first. None of
+# these touch the network except the last, which is opt-in. The stats
+# endpoint is the only real test of an id, so this returns candidates
+# rather than pretending to know which one is right.
+# Gather every team id worth trying, cheapest source first. None of
+# these touch the network except the last, which is opt-in. The stats
+# endpoint is the only real test of an id, so this returns candidates
+# rather than pretending to know which one is right.
+#
+# The lookups are passed in rather than called directly so this can be
+# exercised against stand-in tables without a live baseballr install.
+ncaa_default_lookups <- function(team_query, team_name) {
+  list(
+    "bundled school lookup (by name)" =
+      function() baseballr::ncaa_school_id_lu(team_name),
+    "bundled school lookup (by query)" =
+      function() baseballr::ncaa_school_id_lu(team_query),
+    "bundled school lookup (full table)" =
+      function() baseballr::ncaa_school_id_lu(),
+    "packaged teams release" =
+      function() baseballr::load_ncaa_baseball_teams()
+  )
+}
+
+ncaa_candidate_ids <- function(team_query, team_name, abbreviation,
+                               season, division = 1,
+                               allow_scrape = FALSE, refresh = FALSE,
+                               lookups = NULL, scrape_fn = NULL) {
+  ids <- character()
+  srcs <- character()
+  matched_name <- NA_character_
+
+  consider <- function(tbl, label) {
+    if (is.null(tbl) || !is.data.frame(tbl) || nrow(tbl) == 0) return(invisible())
+    hit <- match_ncaa_rows(janitor::clean_names(tbl), team_query, team_name,
+                           abbreviation, season, division)
+    if (nrow(hit) == 0) return(invisible())
+    found <- as.character(stats::na.omit(c(
+      if ("team_id" %in% names(hit)) hit$team_id[[1]],
+      if ("season_team_id" %in% names(hit)) hit$season_team_id[[1]]
+    )))
+    found <- found[nzchar(found)]
+    if (length(found) == 0) return(invisible())
+    new_ids <- setdiff(found, ids)
+    if (length(new_ids) > 0) {
+      ids  <<- c(ids, new_ids)
+      srcs <<- c(srcs, rep(label, length(new_ids)))
+      if (is.na(matched_name) && "team_name" %in% names(hit)) {
+        matched_name <<- as.character(hit$team_name[[1]])
+      }
+    }
+    invisible()
+  }
+
+  if (is.null(lookups)) lookups <- ncaa_default_lookups(team_query, team_name)
+  for (nm in names(lookups)) {
+    consider(tryCatch(lookups[[nm]](), error = function(e) NULL), nm)
+  }
+
+  # The live index scrape: minutes long, and only when asked for.
+  if (length(ids) == 0 && isTRUE(allow_scrape)) {
+    if (is.null(scrape_fn)) {
+      scrape_fn <- function() {
+        cache_get(
+          c("ncaa_team_index_v2", season, division),
+          function() {
+            progress("  NCAA: scraping the D", division,
+                     " index - this is the slow path...")
+            ncaa_try(baseballr::ncaa_teams, year = season, division = division)
+          },
+          refresh = refresh,
+          fallback = tibble::tibble(),
+          source  = "NCAA",
+          label   = paste0("D", division, " team index"),
+          retry   = FALSE,
+          timeout_seconds = NCAA_TIMEOUT_SECONDS
+        )
+      }
+    }
+    consider(tryCatch(scrape_fn(), error = function(e) NULL), "scraped index")
+  }
+
+  list(
+    ids     = ids,
+    sources = srcs,
+    name    = if (is.na(matched_name)) team_name else matched_name
+  )
+}
+
+pull_ncaa_stats <- function(ncaa_team_id, season, type, refresh = FALSE) {
+  out <- cache_get(
+    c("ncaa_stats", ncaa_team_id, season, type),
+    function() {
+      ncaa_try(
+        baseballr::ncaa_team_player_stats,
+        team_id = ncaa_team_id, year = season, type = type
+      )
+    },
+    refresh = refresh,
+    fallback = tibble::tibble(),
+    source  = "NCAA",
+    label   = paste0("season ", type),
+    retry   = FALSE,
+    timeout_seconds = NCAA_TIMEOUT_SECONDS
+  )
+  if (is.null(out) || nrow(out) == 0) return(tibble::tibble())
+  janitor::clean_names(out)
+}
+
+build_ncaa_batting <- function(raw) {
+  if (is.null(raw) || nrow(raw) == 0) return(tibble::tibble())
+
+  name_col <- pick_col(raw, c("player_name", "name", "player"))
+  if (is.na(name_col)) return(tibble::tibble())
+
+  out <- tibble::tibble(
+    ncaa_name = as.character(raw[[name_col]]),
+    key       = norm_person_key(raw[[name_col]]),
+    Yr        = col_or_na(raw, c("yr", "class"), numeric = FALSE),
+    NPos      = col_or_na(raw, c("pos", "position"), numeric = FALSE),
+    G         = col_or_na(raw, c("gp", "g", "games")),
+    GS        = col_or_na(raw, c("gs", "games_started")),
+    AB        = col_or_na(raw, c("ab")),
+    H         = col_or_na(raw, c("h")),
+    x2B       = col_or_na(raw, c("x2b", "doubles")),
+    x3B       = col_or_na(raw, c("x3b", "triples")),
+    HR        = col_or_na(raw, c("hr")),
+    TB        = col_or_na(raw, c("tb")),
+    RBI       = col_or_na(raw, c("rbi")),
+    BB        = col_or_na(raw, c("bb")),
+    HBP       = col_or_na(raw, c("hbp")),
+    SF        = col_or_na(raw, c("sf")),
+    SH        = col_or_na(raw, c("sh")),
+    K         = col_or_na(raw, c("k", "so")),
+    SB        = col_or_na(raw, c("sb")),
+    CS        = col_or_na(raw, c("cs")),
+    RBI2out   = col_or_na(raw, c("rbi2out", "rbi_2out"))
+  ) |>
+    dplyr::filter(!is.na(key))
+
+  # Recompute the slash line from the counting stats rather than
+  # trusting the published rate columns. If the recomputation
+  # disagrees with the published value, that is itself a finding.
+  out |>
+    dplyr::mutate(
+      PA  = AB + dplyr::coalesce(BB, 0) + dplyr::coalesce(HBP, 0) +
+        dplyr::coalesce(SF, 0) + dplyr::coalesce(SH, 0),
+      TB  = dplyr::if_else(
+        is.na(TB),
+        dplyr::coalesce(H, 0) + dplyr::coalesce(x2B, 0) +
+          2 * dplyr::coalesce(x3B, 0) + 3 * dplyr::coalesce(HR, 0),
+        TB
+      ),
+      AVG = rate_per(H, AB),
+      OBP = rate_per(
+        dplyr::coalesce(H, 0) + dplyr::coalesce(BB, 0) + dplyr::coalesce(HBP, 0),
+        AB + dplyr::coalesce(BB, 0) + dplyr::coalesce(HBP, 0) + dplyr::coalesce(SF, 0)
+      ),
+      SLG   = rate_per(TB, AB),
+      OPS   = OBP + SLG,
+      ISO   = SLG - AVG,
+      BBpct = rate_per(BB, PA),
+      Kpct  = rate_per(K, PA),
+      SBatt = dplyr::coalesce(SB, 0) + dplyr::coalesce(CS, 0),
+      SBpct = rate_per(SB, SBatt)
+    )
+}
+
+build_ncaa_pitching <- function(raw) {
+  if (is.null(raw) || nrow(raw) == 0) return(tibble::tibble())
+
+  name_col <- pick_col(raw, c("player_name", "name", "player"))
+  if (is.na(name_col)) return(tibble::tibble())
+
+  out <- tibble::tibble(
+    ncaa_name = as.character(raw[[name_col]]),
+    key       = norm_person_key(raw[[name_col]]),
+    App       = col_or_na(raw, c("app", "g", "gp")),
+    GS        = col_or_na(raw, c("gs")),
+    IP_raw    = col_or_na(raw, c("ip")),
+    H         = col_or_na(raw, c("h")),
+    R         = col_or_na(raw, c("r")),
+    ER        = col_or_na(raw, c("er")),
+    BB        = col_or_na(raw, c("bb")),
+    K         = col_or_na(raw, c("so", "k")),
+    HR_A      = col_or_na(raw, c("hr_a", "hr")),
+    HB        = col_or_na(raw, c("hb", "hbp")),
+    WP        = col_or_na(raw, c("wp")),
+    SV        = col_or_na(raw, c("sv"))
+  ) |>
+    dplyr::filter(!is.na(key))
+
+  out |>
+    dplyr::mutate(
+      Outs = ip_to_outs(IP_raw),
+      IP   = outs_to_ip_num(Outs),
+      ERA  = rate_per(ER, IP, 9),
+      K9   = rate_per(K, IP, 9),
+      BB9  = rate_per(BB, IP, 9),
+      H9   = rate_per(H, IP, 9),
+      KBB  = rate_per(K, BB),
+      WHIP = rate_per(dplyr::coalesce(BB, 0) + dplyr::coalesce(H, 0), IP)
+    )
+}
+```
+
+```{r window_builders}
+# ============================================================
+# 8. RECENT-WINDOW BUILDERS (ESPN BOX SCORES)
+# ============================================================
+# Everything here is explicitly a WINDOW stat computed from the
+# games that actually downloaded. Nothing in this section is a
+# season-to-date figure, and nothing here is mixed with one.
+
+# One player, one identity. Two things can split a player in two:
+# a different spelling of the name, and ESPN issuing more than one
+# athlete_id for the same person. Both are resolved here, once, so
+# every table downstream inherits a single row per player rather
+# than each table having to defend itself.
+build_identity_map <- function(player_df) {
+  if (is.null(player_df) || nrow(player_df) == 0) return(tibble::tibble())
+  x <- janitor::clean_names(player_df)
+  if (!all(c("athlete_id", "athlete_display_name", "team_id") %in% names(x))) {
+    return(tibble::tibble())
+  }
+
+  base <- tibble::tibble(
+    athlete_id = as.character(x$athlete_id),
+    team_id    = as.character(x$team_id),
+    raw_name   = as.character(x$athlete_display_name)
+  ) |>
+    dplyr::filter(!is.na(athlete_id), nzchar(athlete_id), !is.na(raw_name)) |>
+    dplyr::mutate(
+      clean = tidy_display_name(raw_name),
+      key   = norm_person_key(raw_name)
+    ) |>
+    dplyr::filter(!is.na(key))
+
+  if (nrow(base) == 0) return(tibble::tibble())
+
+  # The id that appears most often becomes the one true id.
+  canon_id <- base |>
+    dplyr::count(team_id, key, athlete_id, name = "rows") |>
+    dplyr::group_by(team_id, key) |>
+    dplyr::arrange(dplyr::desc(rows), athlete_id, .by_group = TRUE) |>
+    dplyr::slice_head(n = 1) |>
+    dplyr::ungroup() |>
+    dplyr::select(team_id, key, canonical_id = athlete_id)
+
+  # The most-used spelling becomes the display name; ties break to
+  # the shortest, which is the one without the middle initial.
+  canon_name <- base |>
+    dplyr::count(team_id, key, clean, name = "rows") |>
+    dplyr::group_by(team_id, key) |>
+    dplyr::arrange(dplyr::desc(rows), nchar(clean), clean, .by_group = TRUE) |>
+    dplyr::slice_head(n = 1) |>
+    dplyr::ungroup() |>
+    dplyr::select(team_id, key, Player = clean)
+
+  # Variance is counted on the RAW spellings, before tidying, so the
+  # Data Quality tab can report what was actually merged.
+  variants <- base |>
+    dplyr::group_by(team_id, key) |>
+    dplyr::summarise(
+      id_variants   = dplyr::n_distinct(athlete_id),
+      name_variants = dplyr::n_distinct(raw_name),
+      .groups = "drop"
+    )
+
+  canon <- canon_id |>
+    dplyr::left_join(canon_name, by = c("team_id", "key")) |>
+    dplyr::left_join(variants,   by = c("team_id", "key"))
+
+  base |>
+    dplyr::count(athlete_id, team_id, key, name = "rows") |>
+    dplyr::group_by(athlete_id) |>
+    dplyr::arrange(dplyr::desc(rows), .by_group = TRUE) |>
+    dplyr::slice_head(n = 1) |>
+    dplyr::ungroup() |>
+    dplyr::select(athlete_id, team_id, key) |>
+    dplyr::left_join(canon, by = c("team_id", "key"))
+}
+
+apply_identity <- function(df, identity) {
+  if (is.null(identity) || nrow(identity) == 0 ||
+      is.null(df) || nrow(df) == 0) {
+    return(df)
+  }
+  df |>
+    dplyr::left_join(
+      dplyr::select(identity, athlete_id, .canon_id = canonical_id,
+                    .canon_name = Player),
+      by = "athlete_id"
+    ) |>
+    dplyr::mutate(
+      athlete_id = dplyr::coalesce(.canon_id, athlete_id),
+      Player     = dplyr::coalesce(.canon_name, Player)
+    ) |>
+    dplyr::select(-.canon_id, -.canon_name)
+}
+
+espn_batting_rows <- function(player_df, focal_id, identity = NULL) {
+  if (is.null(player_df) || nrow(player_df) == 0) return(tibble::tibble())
+  x <- janitor::clean_names(player_df)
+  required <- c("team_id", "stat_group", "game_id", "athlete_id",
+                "athlete_display_name")
+  if (!all(required %in% names(x))) return(tibble::tibble())
+
+  x <- x[
+    as.character(x$team_id) == as.character(focal_id) &
+      stringr::str_to_lower(x$stat_group) == "batting",
+    ,
+    drop = FALSE
+  ]
+  if (nrow(x) == 0) return(tibble::tibble())
+
+  tibble::tibble(
+    game_id    = as.character(x$game_id),
+    game_date  = as_date_safe(col_or_na(x, "game_date", numeric = FALSE)),
+    athlete_id = as.character(x$athlete_id),
+    Player     = as.character(x$athlete_display_name),
+    Pos        = col_or_na(x, c("athlete_position_abbreviation"), numeric = FALSE),
+    starter    = as_lgl(x$starter),
+    bat_order  = col_or_na(x, "bat_order"),
+    AB   = col_or_na(x, "ab"),
+    R    = col_or_na(x, "r"),
+    H    = col_or_na(x, "h"),
+    x2B  = col_or_na(x, c("x2b", "doubles")),
+    x3B  = col_or_na(x, c("x3b", "triples")),
+    HR   = col_or_na(x, "hr"),
+    RBI  = col_or_na(x, "rbi"),
+    BB   = col_or_na(x, "bb"),
+    HBP  = col_or_na(x, c("hbp")),
+    K    = col_or_na(x, "k"),
+    SB   = col_or_na(x, c("sb")),
+    std_avg = col_or_na(x, "avg"),
+    std_obp = col_or_na(x, "obp"),
+    std_slg = col_or_na(x, "slg")
+  ) |>
+    apply_identity(identity)
+}
+
+espn_pitching_rows <- function(player_df, focal_id, identity = NULL) {
+  if (is.null(player_df) || nrow(player_df) == 0) return(tibble::tibble())
+  x <- janitor::clean_names(player_df)
+  required <- c("team_id", "stat_group", "game_id", "athlete_id",
+                "athlete_display_name")
+  if (!all(required %in% names(x))) return(tibble::tibble())
+
+  x <- x[
+    as.character(x$team_id) == as.character(focal_id) &
+      stringr::str_to_lower(x$stat_group) == "pitching",
+    ,
+    drop = FALSE
+  ]
+  if (nrow(x) == 0) return(tibble::tibble())
+
+  tibble::tibble(
+    game_id    = as.character(x$game_id),
+    game_date  = as_date_safe(col_or_na(x, "game_date", numeric = FALSE)),
+    athlete_id = as.character(x$athlete_id),
+    Player     = as.character(x$athlete_display_name),
+    starter    = as_lgl(x$starter),
+    Outs = ip_to_outs(col_or_na(x, "ip", numeric = FALSE)),
+    H    = col_or_na(x, "h"),
+    R    = col_or_na(x, "r"),
+    ER   = col_or_na(x, "er"),
+    BB   = col_or_na(x, "bb"),
+    K    = col_or_na(x, "k"),
+    HR   = col_or_na(x, "hr"),
+    Pitches = col_or_na(x, c("pc", "pitches")),
+    std_era = col_or_na(x, "era")
+  ) |>
+    apply_identity(identity)
+}
+
+build_batting_window <- function(bat_rows, window_label) {
+  if (is.null(bat_rows) || nrow(bat_rows) == 0) return(tibble::tibble())
+
+  bat_rows |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      Pos  = safe_first(Pos, ""),
+      G    = dplyr::n_distinct(game_id),
+      AB   = sum(AB, na.rm = TRUE),
+      H    = sum(H, na.rm = TRUE),
+      HR   = sum(HR, na.rm = TRUE),
+      BB   = sum(BB, na.rm = TRUE),
+      K    = sum(K, na.rm = TRUE),
+      RBI  = sum(RBI, na.rm = TRUE),
+      R    = sum(R, na.rm = TRUE),
+      LastGame = suppressWarnings(max(game_date, na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      Window   = window_label,
+      wAVG     = rate_per(H, AB),
+      # Not OBP. ESPN game box scores do not carry HBP or SF, so
+      # a true OBP cannot be built from this window. Reach% is
+      # (H + BB) / (AB + BB) and is labelled as such everywhere.
+      Reach    = rate_per(H + BB, AB + BB),
+      BBpct    = rate_per(BB, AB + BB),
+      Kpct     = rate_per(K, AB + BB),
+      LastGame = as.Date(ifelse(is.finite(LastGame), LastGame, NA))
+    ) |>
+    dplyr::arrange(dplyr::desc(AB))
+}
+
+build_pitching_window <- function(pit_rows, window_label) {
+  if (is.null(pit_rows) || nrow(pit_rows) == 0) return(tibble::tibble())
+
+  pit_rows |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      App  = dplyr::n_distinct(game_id),
+      GS   = sum(starter %in% TRUE, na.rm = TRUE),
+      Outs = sum(Outs, na.rm = TRUE),
+      H    = sum(H, na.rm = TRUE),
+      ER   = sum(ER, na.rm = TRUE),
+      BB   = sum(BB, na.rm = TRUE),
+      K    = sum(K, na.rm = TRUE),
+      HR   = sum(HR, na.rm = TRUE),
+      Pitches  = sum(Pitches, na.rm = TRUE),
+      LastApp  = suppressWarnings(max(game_date, na.rm = TRUE)),
+      .groups  = "drop"
+    ) |>
+    dplyr::mutate(
+      Window = window_label,
+      IPnum  = outs_to_ip_num(Outs),
+      IP     = outs_to_ip_chr(Outs),
+      ERA    = rate_per(ER, IPnum, 9),
+      K9     = rate_per(K, IPnum, 9),
+      BB9    = rate_per(BB, IPnum, 9),
+      H9     = rate_per(H, IPnum, 9),
+      WHIP   = rate_per(BB + H, IPnum),
+      PperOut = rate_per(Pitches, Outs),
+      LastApp = as.Date(ifelse(is.finite(LastApp), LastApp, NA))
+    ) |>
+    dplyr::arrange(dplyr::desc(Outs))
+}
+
+# ============================================================
+# RECENT PERFORMERS - A SHORT, SEPARATE WINDOW
+# ============================================================
+# Deliberately kept apart from the season lists. Over five games
+# these are small samples and they are labelled that way: the
+# at-bats and innings behind every rate are printed on the line.
+
+build_recent_hitters <- function(bat_rows, game_ids, min_ab) {
+  if (is.null(bat_rows) || nrow(bat_rows) == 0 || length(game_ids) == 0) {
+    return(tibble::tibble())
+  }
+  rows <- dplyr::filter(bat_rows, game_id %in% game_ids)
+  if (nrow(rows) == 0) return(tibble::tibble())
+
+  rows |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      G   = dplyr::n_distinct(game_id),
+      AB  = sum(AB, na.rm = TRUE),
+      H   = sum(H, na.rm = TRUE),
+      HR  = sum(HR, na.rm = TRUE),
+      BB  = sum(BB, na.rm = TRUE),
+      K   = sum(K, na.rm = TRUE),
+      RBI = sum(RBI, na.rm = TRUE),
+      R   = sum(R, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      AVG   = rate_per(H, AB),
+      Reach = rate_per(H + BB, AB + BB),
+      Qualified = AB >= min_ab
+    ) |>
+    dplyr::filter(Qualified) |>
+    dplyr::arrange(dplyr::desc(Reach), dplyr::desc(HR), dplyr::desc(H))
+}
+
+build_recent_pitchers <- function(pit_rows, game_ids, min_outs) {
+  if (is.null(pit_rows) || nrow(pit_rows) == 0 || length(game_ids) == 0) {
+    return(tibble::tibble())
+  }
+  rows <- dplyr::filter(pit_rows, game_id %in% game_ids)
+  if (nrow(rows) == 0) return(tibble::tibble())
+
+  rows |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      App  = dplyr::n_distinct(game_id),
+      GS   = sum(starter %in% TRUE, na.rm = TRUE),
+      Outs = sum(Outs, na.rm = TRUE),
+      H    = sum(H, na.rm = TRUE),
+      ER   = sum(ER, na.rm = TRUE),
+      BB   = sum(BB, na.rm = TRUE),
+      K    = sum(K, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      IPnum = outs_to_ip_num(Outs),
+      IP    = outs_to_ip_chr(Outs),
+      ERA   = rate_per(ER, IPnum, 9),
+      WHIP  = rate_per(BB + H, IPnum),
+      K9    = rate_per(K, IPnum, 9),
+      Qualified = Outs >= min_outs
+    ) |>
+    dplyr::filter(Qualified) |>
+    dplyr::arrange(ERA, WHIP, dplyr::desc(K9))
+}
+
+build_expected_lineup <- function(bat_rows, recent_lineup_games = 5) {
+  if (is.null(bat_rows) || nrow(bat_rows) == 0) return(tibble::tibble())
+
+  starts <- bat_rows |>
+    dplyr::filter(
+      starter %in% TRUE,
+      !is.na(bat_order), bat_order >= 1, bat_order <= 9
+    )
+  if (nrow(starts) == 0) return(tibble::tibble())
+
+  recent_ids <- starts |>
+    dplyr::distinct(game_id, game_date) |>
+    dplyr::arrange(dplyr::desc(game_date)) |>
+    dplyr::slice_head(n = recent_lineup_games)
+
+  starts <- dplyr::semi_join(starts, recent_ids, by = c("game_id", "game_date"))
+
+  players <- starts |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      Starts     = dplyr::n_distinct(game_id),
+      MedianSpot = stats::median(bat_order, na.rm = TRUE),
+      AvgSpot    = mean(bat_order, na.rm = TRUE),
+      Pos        = safe_first(Pos, ""),
+      LastStart  = suppressWarnings(max(game_date, na.rm = TRUE)),
+      .groups    = "drop"
+    ) |>
+    dplyr::mutate(
+      Spot = pmin(9, pmax(1, round(MedianSpot))),
+      LastStart = as.Date(ifelse(is.finite(LastStart), LastStart, NA))
+    ) |>
+    dplyr::arrange(MedianSpot, dplyr::desc(Starts))
+
+  # One player per projected spot, but keep the runner-up so the
+  # staff can see where a lineup is genuinely unsettled.
+  primary <- players |>
+    dplyr::group_by(Spot) |>
+    dplyr::arrange(dplyr::desc(Starts), AvgSpot, .by_group = TRUE) |>
+    dplyr::mutate(rank_in_spot = dplyr::row_number()) |>
+    dplyr::ungroup()
+
+  primary |>
+    dplyr::group_by(Spot) |>
+    dplyr::summarise(
+      Player    = Player[rank_in_spot == 1][1],
+      Pos       = Pos[rank_in_spot == 1][1],
+      Starts    = Starts[rank_in_spot == 1][1],
+      LastStart = LastStart[rank_in_spot == 1][1],
+      Alternate = {
+        alt <- Player[rank_in_spot == 2]
+        if (length(alt) == 0 || is.na(alt[1])) "—" else
+          paste0(alt[1], " (", Starts[rank_in_spot == 2][1], ")")
+      },
+      .groups = "drop"
+    ) |>
+    dplyr::arrange(Spot)
+}
+```
+
+```{r rotation_and_bullpen}
+# ============================================================
+# 9. ROTATION PROJECTION BY SERIES SLOT
+# ============================================================
+# The old model scored starters on rest days and printed a
+# percentage. College staffs do not line up on rest days, they
+# line up on series slot - Friday, Saturday, Sunday, midweek -
+# and a percentage implies a precision this data cannot carry.
+# This version scores recency-weighted slot history and reports
+# a tier plus the evidence behind it.
+
+build_rotation_projection <- function(pit_rows, sched_completed, next_game,
+                                      half_life_days = 21) {
+  if (is.null(pit_rows) || nrow(pit_rows) == 0) return(tibble::tibble())
+
+  starts <- pit_rows |>
+    dplyr::filter(starter %in% TRUE) |>
+    dplyr::distinct(athlete_id, Player, game_id, game_date)
+  if (nrow(starts) == 0) return(tibble::tibble())
+
+  slot_lookup <- sched_completed |>
+    dplyr::select(game_id = event_id, series_slot, series_len, slot_label)
+
+  starts <- starts |>
+    dplyr::left_join(slot_lookup, by = "game_id")
+
+  target_slot <- next_game$series_slot %||% NA_real_
+  target_date <- next_game$game_date %||% (max(starts$game_date, na.rm = TRUE) + 5)
+
+  scored <- starts |>
+    dplyr::mutate(
+      days_ago  = as.numeric(target_date - game_date),
+      recency_w = 0.5^(days_ago / half_life_days),
+      slot_w    = dplyr::case_when(
+        is.na(target_slot) | is.na(series_slot) ~ 0.60,
+        series_slot == target_slot ~ 1.00,
+        abs(series_slot - target_slot) == 1 ~ 0.35,
+        TRUE ~ 0.15
+      )
+    ) |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      Starts    = dplyr::n(),
+      LastStart = max(game_date, na.rm = TRUE),
+      SlotMix   = {
+        tab <- table(slot_label[!is.na(slot_label)])
+        if (length(tab) == 0) "—" else
+          paste(paste0(names(tab), "×", as.integer(tab)), collapse = " · ")
+      },
+      SlotStarts = sum(series_slot == target_slot, na.rm = TRUE),
+      RawScore   = sum(recency_w * slot_w, na.rm = TRUE),
+      TypicalRest = {
+        gaps <- diff(sort(game_date))
+        gaps <- as.numeric(gaps)
+        gaps <- gaps[gaps >= 3 & gaps <= 14]
+        if (length(gaps) == 0) NA_real_ else stats::median(gaps)
+      },
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      DaysToGame = as.numeric(target_date - LastStart),
+      # A starter who threw two days ago is not starting.
+      RestPenalty = dplyr::case_when(
+        is.na(DaysToGame) ~ 1,
+        DaysToGame < 3    ~ 0.10,
+        DaysToGame < 4    ~ 0.60,
+        TRUE              ~ 1
+      ),
+      Score = RawScore * RestPenalty
+    )
+
+  total <- sum(scored$Score, na.rm = TRUE)
+
+  scored |>
+    dplyr::mutate(
+      Share = if (is.finite(total) && total > 0) Score / total else NA_real_,
+      Projection = dplyr::case_when(
+        is.na(Share)     ~ "Unclear",
+        Share >= 0.35    ~ "Likely",
+        Share >= 0.15    ~ "Possible",
+        TRUE             ~ "Unlikely"
+      )
+    ) |>
+    dplyr::arrange(dplyr::desc(Score)) |>
+    dplyr::slice_head(n = 6)
+}
+
+
+# ============================================================
+# 10. BULLPEN WORKLOAD
+# ============================================================
+
+build_bullpen_usage <- function(pit_rows, as_of_date, window_days = 7) {
+  if (is.null(pit_rows) || nrow(pit_rows) == 0) return(tibble::tibble())
+
+  relief <- pit_rows |> dplyr::filter(!(starter %in% TRUE))
+  if (nrow(relief) == 0) return(tibble::tibble())
+
+  recent <- relief |>
+    dplyr::filter(game_date >= as_of_date - window_days, game_date <= as_of_date)
+
+  # Back-to-back days is the usage flag a staff actually acts on.
+  b2b <- relief |>
+    dplyr::distinct(athlete_id, game_date) |>
+    dplyr::arrange(athlete_id, game_date) |>
+    dplyr::group_by(athlete_id) |>
+    dplyr::mutate(gap = as.numeric(game_date - dplyr::lag(game_date))) |>
+    dplyr::summarise(
+      B2B = sum(gap == 1 & game_date >= as_of_date - window_days, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  base <- relief |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(Last = max(game_date, na.rm = TRUE), .groups = "drop")
+
+  usage <- recent |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      App7     = dplyr::n_distinct(game_id),
+      Outs7    = sum(Outs, na.rm = TRUE),
+      Pitches7 = sum(Pitches, na.rm = TRUE),
+      .groups  = "drop"
+    )
+
+  base |>
+    dplyr::left_join(usage, by = c("athlete_id", "Player")) |>
+    dplyr::left_join(b2b, by = "athlete_id") |>
+    dplyr::mutate(
+      App7     = tidyr::replace_na(App7, 0L),
+      Outs7    = tidyr::replace_na(Outs7, 0),
+      Pitches7 = tidyr::replace_na(Pitches7, 0),
+      B2B      = tidyr::replace_na(B2B, 0L),
+      DaysRest = as.numeric(as_of_date - Last),
+      IP7      = outs_to_ip_chr(Outs7),
+      Status   = dplyr::case_when(
+        App7 >= 3 | Pitches7 >= 60 | B2B >= 1 ~ "HEAVY",
+        App7 >= 2 | Pitches7 >= 35            ~ "WATCH",
+        TRUE                                  ~ "FRESH"
+      )
+    ) |>
+    dplyr::arrange(DaysRest, dplyr::desc(Pitches7)) |>
+    dplyr::slice_head(n = 12)
+}
+
+
+# ============================================================
+# 11. TEAM BOX-SCORE RATES
+# ============================================================
+# Returns the rates AND a record of which underlying fields
+# actually resolved, so a renamed ESPN column shows up as a
+# disclosed gap instead of a silent zero.
+
+build_team_rates <- function(team_df, focal_id) {
+  empty <- tibble::tibble(
+    Games = 0, HR_G = NA_real_, BB_G = NA_real_, HBP_G = NA_real_,
+    K_G = NA_real_, SB_G = NA_real_, SAC_G = NA_real_,
+    P_K_G = NA_real_, P_BB_G = NA_real_
+  )
+  missing_note <- character()
+
+  if (is.null(team_df) || nrow(team_df) == 0) {
+    return(list(rates = empty, missing = "team box scores unavailable"))
+  }
+
+  x <- janitor::clean_names(team_df)
+  if (!"team_id" %in% names(x)) {
+    return(list(rates = empty, missing = "team_id column missing"))
+  }
+  x <- x[as.character(x$team_id) == as.character(focal_id), , drop = FALSE]
+
+  games <- dplyr::n_distinct(x$game_id)
+  if (games == 0) return(list(rates = empty, missing = "no team rows for this team"))
+
+  total_for <- function(label, candidates) {
+    nm <- pick_col(x, candidates)
+    if (is.na(nm)) {
+      missing_note <<- c(missing_note, label)
+      return(NA_real_)
+    }
+    sum(as_num(x[[nm]]), na.rm = TRUE)
+  }
+
+  rates <- tibble::tibble(
+    Games  = games,
+    HR_G   = total_for("HR",  c("batting_home_runs", "batting_hr")) / games,
+    BB_G   = total_for("BB",  c("batting_walks", "batting_bb")) / games,
+    HBP_G  = total_for("HBP", c("batting_hit_by_pitch", "batting_hit_by_pitches",
+                                "batting_hbp")) / games,
+    K_G    = total_for("K",   c("batting_strikeouts", "batting_k")) / games,
+    SB_G   = total_for("SB",  c("batting_stolen_bases", "batting_sb")) / games,
+    SAC_G  = total_for("SAC", c("batting_sac_hits", "batting_sacrifice_hits",
+                                "batting_sac_bunts")) / games,
+    P_K_G  = total_for("K thrown", c("pitching_strikeouts", "pitching_k")) / games,
+    P_BB_G = total_for("BB issued", c("pitching_walks", "pitching_bb")) / games
+  )
+
+  list(
+    rates = rates,
+    missing = if (length(missing_note) == 0) "" else
+      paste(unique(missing_note), collapse = ", ")
+  )
+}
+```
+
+```{r pbp_engine}
+# ============================================================
+# 12. PLAY-BY-PLAY ENGINE
+# ============================================================
+# Written against the real ESPN college feed, which looks like:
+#
+#   "S. Kretsch pitches to D. West"
+#   "Pitch 4 : Strike 3 Swinging"
+#   "D. West struck out swinging. "
+#   "M. Levu singled to right, R. Cholowsky to third. "
+#
+# Three consequences drive the design:
+#   1. Batters are named by initial and surname, not in full.
+#   2. The feed is pitch-level, so pitch rows and pitcher-matchup
+#      rows have to be dropped before anything is counted.
+#   3. scoreValue is 0 even on scoring plays - runs live in the
+#      running awayScore / homeScore, so they are differenced.
+#
+# Events are attributed only to the player named at the START of
+# the play, so "M. Levu singled to right, R. Cholowsky to third"
+# credits the single to Levu and not to Cholowsky.
+
+PA_RESULT_REGEX <- paste(
+  "singled", "doubled", "tripled", "homered", "home run", "grand slam",
+  "walked", "struck out", "strikeout", "grounded", "flied", "lined",
+  "popped", "fouled out", "flied into", "hit by pitch", "hit into",
+  "reached on", "fielder's choice", "sacrificed", "sacrifice fly",
+  "sac fly", "infield fly", "out at first", "grounded into",
+  sep = "|"
+)
+
+# Rows that are not events: pitch tracking, the pitcher-batter
+# matchup header, and inning banners.
+NON_EVENT_REGEX <- paste(
+  "^pitch\\s*\\d+\\s*:",
+  "\\bpitches to\\b",
+  "^(top|bottom|middle|end) of the\\b",
+  "^(start|end) of\\b",
+  "^game (start|end)",
+  sep = "|"
+)
+
+# Direction is FIELD direction, not pull/oppo: ESPN publishes no
+# batting handedness for college players, so pull side is not
+# knowable. Gap balls go to the half of the field they were hit
+# toward. Bare fielder words are included because this feed writes
+# "to right" and "to short", not "to right field" / "to shortstop".
+FIELD_MAP <- c(
+  "left center" = "Left", "left centerfield" = "Left", "lc" = "Left",
+  "left field" = "Left", "left fielder" = "Left", "left side" = "Left",
+  "left" = "Left", "lf" = "Left", "shortstop" = "Left", "ss" = "Left",
+  "short" = "Left", "third base" = "Left", "third baseman" = "Left",
+  "third" = "Left", "3b" = "Left",
+  "center field" = "Center", "centerfield" = "Center", "center" = "Center",
+  "cf" = "Center", "the middle" = "Center", "middle" = "Center",
+  "pitcher" = "Center", "the mound" = "Center", "catcher" = "Center",
+  "right center" = "Right", "right centerfield" = "Right", "rc" = "Right",
+  "right field" = "Right", "right fielder" = "Right", "right side" = "Right",
+  "right" = "Right", "rf" = "Right", "first base" = "Right",
+  "first baseman" = "Right", "first" = "Right", "1b" = "Right",
+  "second base" = "Right", "second baseman" = "Right", "second" = "Right",
+  "2b" = "Right"
+)
+
+build_field_regex <- function() {
+  keys <- names(FIELD_MAP)
+  keys <- keys[order(-nchar(keys))]
+  paste0(
+    "(?:to|through|down|up|into|over|toward|off)\\s+(?:the\\s+)?(",
+    paste(keys, collapse = "|"), ")\\b"
+  )
+}
+FIELD_REGEX <- build_field_regex()
+
+# "R. Cholowsky" and "Roch Cholowsky" both reduce to r_cholowsky,
+# which is what lets the play text join to the box-score roster.
+initial_last_key <- function(x) {
+  x <- iconv(as.character(x), from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+  x <- stringr::str_squish(stringr::str_replace_all(stringr::str_to_lower(x),
+                                                    "[^a-z ]", " "))
+  vapply(stringr::str_split(x, " "), function(tok) {
+    tok <- tok[nzchar(tok)]
+    tok <- tok[!tok %in% c("jr", "sr", "ii", "iii", "iv")]
+    if (length(tok) < 2) return(NA_character_)
+    paste0(substr(tok[[1]], 1, 1), "_", tok[[length(tok)]])
+  }, character(1), USE.NAMES = FALSE)
+}
+
+last_name_key <- function(x) {
+  x <- iconv(as.character(x), from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+  x <- stringr::str_squish(stringr::str_replace_all(stringr::str_to_lower(x),
+                                                    "[^a-z ]", " "))
+  vapply(stringr::str_split(x, " "), function(tok) {
+    tok <- tok[nchar(tok) > 1]
+    tok <- tok[!tok %in% c("jr", "sr", "ii", "iii", "iv")]
+    if (length(tok) == 0) return(NA_character_)
+    tok[[length(tok)]]
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# Three lookups, tried in order of how much evidence they carry.
+# A bare surname is only allowed to match when it is unique across
+# both rosters, so "Hawk" is never guessed at when two Hawks played.
+build_name_lookups <- function(roster) {
+  if (is.null(roster) || nrow(roster) == 0) {
+    return(list(full = character(), initial = character(), last = character()))
+  }
+  full <- roster$athlete_id
+  names(full) <- roster$key
+
+  il_keys <- initial_last_key(roster$Player)
+  ok_il   <- !is.na(il_keys) & !duplicated(il_keys) &
+    !il_keys %in% il_keys[duplicated(il_keys)]
+  initial <- roster$athlete_id[ok_il]
+  names(initial) <- il_keys[ok_il]
+
+  ln_keys <- last_name_key(roster$Player)
+  ok_ln   <- !is.na(ln_keys) & !ln_keys %in% ln_keys[duplicated(ln_keys)]
+  last <- roster$athlete_id[ok_ln]
+  names(last) <- ln_keys[ok_ln]
+
+  list(full = full, initial = initial, last = last)
+}
+
+match_leading_player <- function(text, lookups) {
+  clean <- stringr::str_squish(stringr::str_replace_all(text, "^[^A-Za-z]+", ""))
+  best  <- rep(NA_character_, length(clean))
+
+  for (k in c(4, 3, 2, 1)) {
+    prefix <- stringr::str_extract(clean, paste0("^(?:\\S+\\s+){", k - 1, "}\\S+"))
+
+    if (k >= 2) {
+      hit  <- unname(lookups$full[norm_person_key(prefix)])
+      take <- is.na(best) & !is.na(hit)
+      best[take] <- hit[take]
+
+      hit  <- unname(lookups$initial[initial_last_key(prefix)])
+      take <- is.na(best) & !is.na(hit)
+      best[take] <- hit[take]
+    }
+
+    hit  <- unname(lookups$last[last_name_key(prefix)])
+    take <- is.na(best) & !is.na(hit)
+    best[take] <- hit[take]
+  }
+  best
+}
+
+# Runner state, clamped at zero, evaluated BEFORE each event.
+state_before <- function(delta) {
+  s <- 0
+  out <- numeric(length(delta))
+  for (i in seq_along(delta)) {
+    out[i] <- s
+    s <- max(0, s + delta[i])
+  }
+  out
+}
+
+# Runs get their own ledger rather than riding on event rows.
+# Two lessons are baked in here. Summing scoreValue double-counts,
+# because pitch rows and the result row of the same at-bat both
+# carry it. Differencing the score on filtered rows loses any run
+# whose delta landed on a row that was dropped. So the ledger is
+# built from the running score across EVERY row, before any
+# filtering, and attribution comes from which side's score moved -
+# no dependence on team_id or the inning-half label.
+build_run_ledger <- function(plays_df, focal_id, sched_completed) {
+  if (is.null(plays_df) || nrow(plays_df) == 0) return(tibble::tibble())
+  x <- janitor::clean_names(plays_df)
+  if (!all(c("game_id", "away_score", "home_score") %in% names(x))) {
+    return(tibble::tibble())
+  }
+
+  rows <- tibble::tibble(
+    game_id    = as.character(x$game_id),
+    inning     = col_or_na(x, c("period_number")),
+    away_score = col_or_na(x, c("away_score")),
+    home_score = col_or_na(x, c("home_score"))
+  ) |>
+    dplyr::filter(!is.na(inning), inning >= 1)
+
+  if (nrow(rows) == 0) return(tibble::tibble())
+
+  # Highest score REACHED in each inning, then difference those.
+  # Row order inside an inning is irrelevant, no row needs to be
+  # the one "carrying" the run, and dropping rows cannot lose one.
+  # Only the innings themselves need to be in order, and they are
+  # sorted here explicitly.
+  per_inning <- rows |>
+    dplyr::group_by(game_id, Inning = inning) |>
+    dplyr::summarise(
+      away_max = suppressWarnings(max(away_score, na.rm = TRUE)),
+      home_max = suppressWarnings(max(home_score, na.rm = TRUE)),
+      .groups  = "drop"
+    ) |>
+    dplyr::mutate(
+      away_max = dplyr::if_else(is.finite(away_max), away_max, NA_real_),
+      home_max = dplyr::if_else(is.finite(home_max), home_max, NA_real_)
+    ) |>
+    dplyr::arrange(game_id, Inning) |>
+    dplyr::group_by(game_id) |>
+    dplyr::mutate(
+      # cummax guards against a mid-inning correction reading low
+      away_cum = cummax(tidyr::replace_na(away_max, 0)),
+      home_cum = cummax(tidyr::replace_na(home_max, 0)),
+      d_away   = away_cum - dplyr::lag(away_cum, default = 0),
+      d_home   = home_cum - dplyr::lag(home_cum, default = 0)
+    ) |>
+    dplyr::ungroup()
+
+  ctx <- sched_completed |>
+    dplyr::select(game_id = event_id, home_away)
+
+  per_inning |>
+    dplyr::left_join(ctx, by = "game_id") |>
+    dplyr::mutate(
+      focal_is_home = stringr::str_to_lower(dplyr::coalesce(home_away, "")) == "home",
+      FocalRuns = dplyr::if_else(focal_is_home, d_home, d_away),
+      OppRuns   = dplyr::if_else(focal_is_home, d_away, d_home)
+    ) |>
+    dplyr::select(game_id, Inning, FocalRuns, OppRuns)
+}
+
+parse_pbp <- function(plays_df, focal_id, roster, sched_completed) {
+  empty <- tibble::tibble()
+  if (is.null(plays_df) || nrow(plays_df) == 0) return(empty)
+
+  x <- janitor::clean_names(plays_df)
+  if (!all(c("game_id", "text") %in% names(x))) return(empty)
+
+  raw <- tibble::tibble(
+    game_id = as.character(x$game_id),
+    seq     = col_or_na(x, c("sequence_number", "id")),
+    at_bat  = col_or_na(x, c("at_bat_id"), numeric = FALSE),
+    text    = as.character(x$text),
+    team_id = col_or_na(x, c("team_id"), numeric = FALSE),
+    inning  = col_or_na(x, c("period_number")),
+    half    = col_or_na(x, c("period_type", "period_display_value"),
+                        numeric = FALSE),
+    away_score = col_or_na(x, c("away_score")),
+    home_score = col_or_na(x, c("home_score"))
+  ) |>
+    dplyr::filter(!is.na(text), nzchar(stringr::str_squish(text))) |>
+    dplyr::arrange(game_id, seq)
+
+  if (nrow(raw) == 0) return(empty)
+
+  # Runs are NOT taken from these rows - see build_run_ledger.
+  ev <- raw |>
+    dplyr::mutate(lower = stringr::str_to_lower(stringr::str_squish(text))) |>
+    dplyr::filter(!stringr::str_detect(lower, NON_EVENT_REGEX)) |>
+    dplyr::distinct(game_id, at_bat, text, .keep_all = TRUE)
+
+  if (nrow(ev) == 0) return(empty)
+
+  ctx <- sched_completed |>
+    dplyr::select(game_id = event_id, home_away, opponent_label, d1_opponent,
+                  game_date)
+
+  ev <- dplyr::left_join(ev, ctx, by = "game_id")
+
+  lookups <- build_name_lookups(roster)
+
+  ev <- ev |>
+    dplyr::mutate(
+      half_lower = stringr::str_to_lower(dplyr::coalesce(half, "")),
+      bats_home  = dplyr::case_when(
+        stringr::str_detect(half_lower, "bottom") ~ TRUE,
+        stringr::str_detect(half_lower, "top")    ~ FALSE,
+        TRUE ~ NA
+      ),
+      home_is_focal = stringr::str_to_lower(dplyr::coalesce(home_away, "")) == "home",
+      # Which side is batting is derived from the inning half, which
+      # is unambiguous. team_id is only the fallback.
+      actor_id = match_leading_player(text, lookups),
+      is_pa    = stringr::str_detect(lower, PA_RESULT_REGEX),
+      is_hit   = stringr::str_detect(lower, "singled|doubled|tripled|homered|home run|grand slam"),
+      is_hr    = stringr::str_detect(lower, "homered|home run|grand slam"),
+      is_bb    = stringr::str_detect(lower, "\\bwalked\\b|intentionally walked"),
+      is_hbp   = stringr::str_detect(lower, "hit by pitch"),
+      is_k     = stringr::str_detect(lower, "struck out|strikeout"),
+      is_roe   = stringr::str_detect(lower, "reached on (an )?error"),
+      is_bunt  = stringr::str_detect(lower, "\\bbunt"),
+      is_sac_bunt = stringr::str_detect(lower, "sacrifice bunt|sacrificed"),
+      is_steal = stringr::str_detect(lower, "\\bstole\\b|stolen base"),
+      is_cs    = stringr::str_detect(lower, "caught stealing"),
+      is_po    = stringr::str_detect(lower, "picked off|pickoff"),
+      # Runs the play TEXT actually names. A home run scores the
+      # batter without the text saying "scored", so he is added.
+      # This is deliberately independent of the score columns -
+      # it measures whether the text parse is seeing the game.
+      text_runs = stringr::str_count(lower, "\\bscored\\b") +
+        as.numeric(stringr::str_detect(lower, "homered|home run|grand slam")),
+      bb_type = dplyr::case_when(
+        stringr::str_detect(lower, "homered|home run|grand slam") ~ "HR",
+        stringr::str_detect(lower, "popped|pop up|pop fly|infield fly|fouled out") ~ "PU",
+        stringr::str_detect(lower, "\\blined\\b|line drive") ~ "LD",
+        stringr::str_detect(lower, "flied|fly ball|sacrifice fly|sac fly") ~ "FB",
+        stringr::str_detect(lower, "grounded|ground ball|bunt|infield single") ~ "GB",
+        TRUE ~ NA_character_
+      ),
+      direction = unname(FIELD_MAP[stringr::str_match(lower, FIELD_REGEX)[, 2]])
+    )
+
+  # Runners in scoring position, derived and deliberately
+  # conservative. A runner advance is written as a clause after a
+  # comma - "singled to right, R. Cholowsky to third" - which is
+  # what separates it from a fielder ("grounded out to third").
+  ev <- ev |>
+    dplyr::mutate(
+      gain = as.numeric(
+        stringr::str_detect(lower, "doubled|tripled|stole second|stole third") |
+          stringr::str_detect(lower, ",[^,]*\\bto (second|third)\\b") |
+          stringr::str_detect(lower, "advanced to (second|third)")
+      ),
+      loss = stringr::str_count(lower, "scored") +
+        as.numeric(stringr::str_detect(
+          lower,
+          "caught stealing|picked off|doubled off|out at third|out at home|thrown out at"
+        )),
+      delta = gain - loss
+    ) |>
+    dplyr::group_by(game_id, inning, half) |>
+    dplyr::mutate(risp_before = state_before(delta) > 0) |>
+    dplyr::ungroup()
+
+  ev <- ev |>
+    dplyr::group_by(game_id, actor_id) |>
+    dplyr::mutate(
+      pa_index = dplyr::if_else(
+        is_pa & !is.na(actor_id), cumsum(is_pa & !is.na(actor_id)), NA_integer_
+      )
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::group_by(game_id, inning, half) |>
+    dplyr::mutate(
+      inning_pa = dplyr::if_else(is_pa, cumsum(is_pa), NA_integer_),
+      leadoff   = inning_pa == 1
+    ) |>
+    dplyr::ungroup()
+
+  # Whose half-inning it is: the batter's own team settles it when
+  # the batter was identified, the inning half when he wasn't, and
+  # the play's team_id only as a last resort.
+  ev |>
+    dplyr::left_join(
+      dplyr::select(roster, actor_id = athlete_id, actor = Player,
+                    actor_team = team_id),
+      by = "actor_id"
+    ) |>
+    dplyr::mutate(
+      is_focal = dplyr::case_when(
+        !is.na(actor_team) ~ actor_team == as.character(focal_id),
+        !is.na(bats_home)  ~ bats_home == home_is_focal,
+        !is.na(team_id)    ~ team_id == as.character(focal_id),
+        TRUE ~ NA
+      ),
+      is_focal = tidyr::replace_na(is_focal, FALSE)
+    )
+}
+
+pbp_coverage <- function(events) {
+  if (is.null(events) || nrow(events) == 0) {
+    return(tibble::tibble(
+      Metric = "Play-by-play", Value = "no plays parsed", Detail = ""
+    ))
+  }
+  pa <- dplyr::filter(events, is_pa)
+  bip <- dplyr::filter(pa, !is_k, !is_bb, !is_hbp)
+  tibble::tibble(
+    Metric = c(
+      "Event rows kept",
+      "Plate appearances identified",
+      "PA attributed to a named batter",
+      "Balls in play with a resolved direction",
+      "Balls in play with a resolved type"
+    ),
+    Value = c(
+      as.character(nrow(events)),
+      as.character(nrow(pa)),
+      fmt_pct(mean(!is.na(pa$actor_id))),
+      fmt_pct(mean(!is.na(bip$direction))),
+      fmt_pct(mean(!is.na(bip$bb_type)))
+    ),
+    Detail = c(
+      "pitch-tracking and matchup rows removed",
+      "text matched a plate-appearance result",
+      "leading-name match against the box-score roster",
+      "left / center / right, from the play text",
+      "GB / LD / FB / PU / HR"
+    )
+  )
+}
+```
+
+```{r spray_and_splits}
+# ============================================================
+# 13. SPRAY / BATTED-BALL PROFILE
+# ============================================================
+
+build_spray <- function(events, focal_id, min_bip = 8) {
+  if (is.null(events) || nrow(events) == 0) return(tibble::tibble())
+
+  bip <- events |>
+    dplyr::filter(
+      is_focal, is_pa, !is.na(actor_id),
+      !is_k, !is_bb, !is_hbp
+    )
+  if (nrow(bip) == 0) return(tibble::tibble())
+
+  bip |>
+    dplyr::group_by(actor_id, Player = actor) |>
+    dplyr::summarise(
+      BIP     = dplyr::n(),
+      DirN    = sum(!is.na(direction)),
+      Left    = sum(direction == "Left", na.rm = TRUE),
+      Center  = sum(direction == "Center", na.rm = TRUE),
+      Right   = sum(direction == "Right", na.rm = TRUE),
+      TypeN   = sum(!is.na(bb_type)),
+      GB      = sum(bb_type == "GB", na.rm = TRUE),
+      LD      = sum(bb_type == "LD", na.rm = TRUE),
+      FB      = sum(bb_type == "FB", na.rm = TRUE),
+      PU      = sum(bb_type == "PU", na.rm = TRUE),
+      HR      = sum(bb_type == "HR", na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      LeftPct   = rate_per(Left,   DirN),
+      CenterPct = rate_per(Center, DirN),
+      RightPct  = rate_per(Right,  DirN),
+      GBPct     = rate_per(GB, TypeN),
+      AirPct    = rate_per(FB + LD + PU + HR, TypeN),
+      DirCover  = rate_per(DirN, BIP),
+      Lean = dplyr::case_when(
+        is.na(LeftPct) | DirN < min_bip ~ "—",
+        LeftPct  >= 0.50 ~ "Left side",
+        RightPct >= 0.50 ~ "Right side",
+        CenterPct >= 0.45 ~ "Middle",
+        TRUE ~ "Spread"
+      )
+    ) |>
+    dplyr::arrange(dplyr::desc(BIP))
+}
+
+
+# ============================================================
+# 14. HITTER SITUATIONAL SPLITS (PBP-DERIVED)
+# ============================================================
+
+split_line <- function(df, label) {
+  if (nrow(df) == 0) {
+    return(tibble::tibble(
+      Split = label, PA = 0L, H = 0L, BB = 0L, K = 0L,
+      OB = NA_real_, Kpct = NA_real_
+    ))
+  }
+  tibble::tibble(
+    Split = label,
+    PA    = nrow(df),
+    H     = sum(df$is_hit, na.rm = TRUE),
+    BB    = sum(df$is_bb, na.rm = TRUE),
+    K     = sum(df$is_k, na.rm = TRUE),
+    OB    = rate_per(
+      sum(df$is_hit, na.rm = TRUE) + sum(df$is_bb, na.rm = TRUE) +
+        sum(df$is_hbp, na.rm = TRUE),
+      nrow(df)
+    ),
+    Kpct  = rate_per(sum(df$is_k, na.rm = TRUE), nrow(df))
+  )
+}
+
+build_team_situational <- function(events, side = c("offense", "defense")) {
+  side <- match.arg(side)
+  if (is.null(events) || nrow(events) == 0) return(tibble::tibble())
+
+  pa <- events |>
+    dplyr::filter(is_pa, if (side == "offense") is_focal else !is_focal)
+  if (nrow(pa) == 0) return(tibble::tibble())
+
+  dplyr::bind_rows(
+    split_line(pa, "All plate appearances"),
+    split_line(dplyr::filter(pa, risp_before %in% TRUE), "Runners in scoring position"),
+    split_line(dplyr::filter(pa, !(risp_before %in% TRUE)), "Bases empty / no RISP"),
+    split_line(dplyr::filter(pa, leadoff %in% TRUE), "Leading off an inning"),
+    split_line(dplyr::filter(pa, pa_index %in% 1), "First look (1st PA of game)"),
+    split_line(dplyr::filter(pa, pa_index >= 3), "Third look or later"),
+    split_line(dplyr::filter(pa, inning <= 3), "Innings 1-3"),
+    split_line(dplyr::filter(pa, inning >= 4 & inning <= 6), "Innings 4-6"),
+    split_line(dplyr::filter(pa, inning >= 7), "Innings 7+"),
+    split_line(
+      dplyr::filter(pa, stringr::str_to_lower(home_away) == "home"), "At home"
+    ),
+    split_line(
+      dplyr::filter(pa, stringr::str_to_lower(home_away) == "away"), "On the road"
+    )
+  )
+}
+
+build_hitter_splits <- function(events, min_pa = 20) {
+  if (is.null(events) || nrow(events) == 0) return(tibble::tibble())
+
+  pa <- events |> dplyr::filter(is_focal, is_pa, !is.na(actor_id))
+  if (nrow(pa) == 0) return(tibble::tibble())
+
+  pa |>
+    dplyr::group_by(actor_id, Player = actor) |>
+    dplyr::summarise(
+      PA       = dplyr::n(),
+      OB       = rate_per(sum(is_hit) + sum(is_bb) + sum(is_hbp), dplyr::n()),
+      Kpct     = rate_per(sum(is_k), dplyr::n()),
+      BBpct    = rate_per(sum(is_bb), dplyr::n()),
+      RISP_PA  = sum(risp_before %in% TRUE),
+      RISP_H   = sum(is_hit & risp_before %in% TRUE),
+      RISP_K   = sum(is_k & risp_before %in% TRUE),
+      Lead_PA  = sum(leadoff %in% TRUE),
+      Lead_OB  = rate_per(
+        sum((is_hit | is_bb | is_hbp) & leadoff %in% TRUE),
+        sum(leadoff %in% TRUE)
+      ),
+      First_OB = rate_per(
+        sum((is_hit | is_bb | is_hbp) & pa_index %in% 1),
+        sum(pa_index %in% 1)
+      ),
+      Later_OB = rate_per(
+        sum((is_hit | is_bb | is_hbp) & pa_index >= 3),
+        sum(pa_index >= 3)
+      ),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      RISP_avg = rate_per(RISP_H, RISP_PA),
+      Enough   = PA >= min_pa
+    ) |>
+    dplyr::arrange(dplyr::desc(PA))
+}
+
+
+# ============================================================
+# 15. RUNNING GAME
+# ============================================================
+
+build_running_game <- function(events, n_games) {
+  blank <- list(
+    totals = tibble::tibble(Metric = character(), Value = character()),
+    players = tibble::tibble()
+  )
+  if (is.null(events) || nrow(events) == 0) return(blank)
+
+  off <- dplyr::filter(events, is_focal)
+  if (nrow(off) == 0) return(blank)
+
+  steals   <- dplyr::filter(off, is_steal)
+  caught   <- dplyr::filter(off, is_cs)
+  picked   <- dplyr::filter(off, is_po)
+  bunts    <- dplyr::filter(off, is_bunt)
+  sacs     <- dplyr::filter(off, is_sac_bunt)
+
+  attempts <- nrow(steals) + nrow(caught)
+  per_game <- function(n) if (n_games > 0) fmt(n / n_games, 2) else "—"
+
+  totals <- tibble::tibble(
+    Metric = c(
+      "Stolen bases", "Caught stealing", "Steal attempts",
+      "Steal success rate", "Picked off", "Bunt attempts", "Sacrifice bunts"
+    ),
+    Value = c(
+      as.character(nrow(steals)),
+      as.character(nrow(caught)),
+      as.character(attempts),
+      if (attempts > 0) fmt_pct(nrow(steals) / attempts) else "—",
+      as.character(nrow(picked)),
+      as.character(nrow(bunts)),
+      as.character(nrow(sacs))
+    ),
+    PerGame = c(
+      per_game(nrow(steals)), per_game(nrow(caught)), per_game(attempts),
+      "", per_game(nrow(picked)), per_game(nrow(bunts)), per_game(nrow(sacs))
+    )
+  )
+
+  runners <- dplyr::bind_rows(
+    dplyr::mutate(steals, .kind = "SB"),
+    dplyr::mutate(caught, .kind = "CS"),
+    dplyr::mutate(bunts,  .kind = "BUNT")
+  ) |>
+    dplyr::filter(!is.na(actor_id))
+
+  players <- if (nrow(runners) == 0) tibble::tibble() else {
+    runners |>
+      dplyr::group_by(actor_id, Player = actor) |>
+      dplyr::summarise(
+        SB   = sum(.kind == "SB"),
+        CS   = sum(.kind == "CS"),
+        Bunt = sum(.kind == "BUNT"),
+        .groups = "drop"
+      ) |>
+      dplyr::mutate(
+        Att = SB + CS,
+        Success = rate_per(SB, Att)
+      ) |>
+      dplyr::arrange(dplyr::desc(Att), dplyr::desc(Bunt)) |>
+      dplyr::slice_head(n = 8)
+  }
+
+  list(totals = totals, players = players)
+}
+
+
+# ============================================================
+# 16. PITCHER SPLITS FROM THE BOX SCORES
+# ============================================================
+# Attributing a play to the pitcher on the mound is not reliable
+# from ESPN college play-by-play, so per-pitcher splits are built
+# from box-score appearances, which are complete. Anything that
+# needs the man on the mound is reported at staff level instead
+# and labelled that way.
+
+pitcher_role_splits <- function(pit_rows, sched_completed) {
+  if (is.null(pit_rows) || nrow(pit_rows) == 0) return(tibble::tibble())
+
+  ctx <- sched_completed |>
+    dplyr::select(game_id = event_id, home_away, d1_opponent)
+
+  rows <- dplyr::left_join(pit_rows, ctx, by = "game_id")
+
+  summarise_slice <- function(df, label) {
+    if (nrow(df) == 0) return(tibble::tibble())
+    df |>
+      dplyr::group_by(athlete_id, Player) |>
+      dplyr::summarise(
+        Split = label,
+        App   = dplyr::n_distinct(game_id),
+        Outs  = sum(Outs, na.rm = TRUE),
+        H     = sum(H, na.rm = TRUE),
+        ER    = sum(ER, na.rm = TRUE),
+        BB    = sum(BB, na.rm = TRUE),
+        K     = sum(K, na.rm = TRUE),
+        .groups = "drop"
+      )
+  }
+
+  dplyr::bind_rows(
+    summarise_slice(dplyr::filter(rows, starter %in% TRUE), "As starter"),
+    summarise_slice(dplyr::filter(rows, !(starter %in% TRUE)), "In relief"),
+    summarise_slice(
+      dplyr::filter(rows, stringr::str_to_lower(home_away) == "home"), "At home"
+    ),
+    summarise_slice(
+      dplyr::filter(rows, stringr::str_to_lower(home_away) == "away"), "On the road"
+    ),
+    summarise_slice(dplyr::filter(rows, d1_opponent %in% TRUE), "vs Division I"),
+    summarise_slice(dplyr::filter(rows, !(d1_opponent %in% TRUE)), "vs non-D1 / unlisted")
+  ) |>
+    dplyr::mutate(
+      IPnum = outs_to_ip_num(Outs),
+      IP    = outs_to_ip_chr(Outs),
+      ERA   = rate_per(ER, IPnum, 9),
+      WHIP  = rate_per(BB + H, IPnum),
+      K9    = rate_per(K, IPnum, 9),
+      BB9   = rate_per(BB, IPnum, 9)
+    )
+}
+
+starter_workload <- function(pit_rows) {
+  if (is.null(pit_rows) || nrow(pit_rows) == 0) return(tibble::tibble())
+  starts <- dplyr::filter(pit_rows, starter %in% TRUE)
+  if (nrow(starts) == 0) return(tibble::tibble())
+
+  starts |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      GS         = dplyr::n_distinct(game_id),
+      MedOuts    = stats::median(Outs, na.rm = TRUE),
+      MaxOuts    = suppressWarnings(max(Outs, na.rm = TRUE)),
+      MedPitches = stats::median(Pitches[Pitches > 0], na.rm = TRUE),
+      MaxPitches = suppressWarnings(max(Pitches, na.rm = TRUE)),
+      .groups    = "drop"
+    ) |>
+    dplyr::mutate(
+      TypicalIP = outs_to_ip_chr(round(MedOuts)),
+      LongestIP = outs_to_ip_chr(ifelse(is.finite(MaxOuts), MaxOuts, NA)),
+      MedPitches = ifelse(is.finite(MedPitches), MedPitches, NA_real_),
+      MaxPitches = ifelse(is.finite(MaxPitches), MaxPitches, NA_real_)
+    ) |>
+    dplyr::arrange(dplyr::desc(GS), dplyr::desc(MedOuts))
+}
+```
+
+```{r baseline_flags_plan}
+# ============================================================
+# 17. DIVISION I BASELINE + PERCENTILES
+# ============================================================
+
+build_d1_baseline <- function(season, refresh = FALSE) {
+  raw <- cache_get(
+    c("espn_standings", season),
+    function() baseballr::espn_college_baseball_standings(year = season),
+    refresh = refresh,
+    fallback = tibble::tibble(),
+    source  = "ESPN",
+    label   = "Division I standings"
+  )
+  if (is.null(raw) || nrow(raw) == 0) return(tibble::tibble())
+
+  x <- janitor::clean_names(raw)
+  team_col <- pick_col(x, c("team", "team_name", "display_name"))
+  if (is.na(team_col)) return(tibble::tibble())
+
+  out <- tibble::tibble(
+    Team     = as.character(x[[team_col]]),
+    TeamNorm = normalize_team_name(x[[team_col]]),
+    G   = col_or_na(x, c("gamesplayed", "games_played")),
+    W   = col_or_na(x, c("wins")),
+    L   = col_or_na(x, c("losses")),
+    RF  = col_or_na(x, c("pointsfor", "points_for")),
+    RA  = col_or_na(x, c("pointsagainst", "points_against")),
+    RDt = col_or_na(x, c("pointdifferential", "point_differential")),
+    WPu = col_or_na(x, c("winpercent", "win_percent"))
+  )
+
+  out |>
+    dplyr::filter(!is.na(G), G > 0) |>
+    dplyr::mutate(
+      WinPct = dplyr::if_else(is.finite(WPu) & WPu > 0, WPu, rate_per(W, G)),
+      R_G    = rate_per(RF, G),
+      RA_G   = rate_per(RA, G),
+      RD_G   = dplyr::if_else(
+        is.finite(R_G) & is.finite(RA_G), R_G - RA_G, rate_per(RDt, G)
+      )
+    )
+}
+
+find_team_in_baseline <- function(baseline, team_query, team_name, abbreviation) {
+  if (is.null(baseline) || nrow(baseline) == 0) return(tibble::tibble())
+  candidates <- unique(normalize_team_name(c(team_name, team_query, abbreviation)))
+  candidates <- candidates[nchar(candidates) > 1]
+
+  exact <- baseline[baseline$TeamNorm %in% candidates, , drop = FALSE]
+  if (nrow(exact) >= 1) return(exact[1, , drop = FALSE])
+
+  for (cand in candidates) {
+    if (nchar(cand) < 3) next
+    hit <- baseline[
+      stringr::str_detect(baseline$TeamNorm, stringr::fixed(cand)) |
+        stringr::str_detect(cand, stringr::fixed(baseline$TeamNorm)),
+      ,
+      drop = FALSE
+    ]
+    if (nrow(hit) >= 1) return(hit[1, , drop = FALSE])
+  }
+  tibble::tibble()
+}
+
+rank_and_percentile <- function(value, population, higher_is_better = TRUE) {
+  population <- population[is.finite(population)]
+  if (!is.finite(value) || length(population) < 25) {
+    return(list(pct = NA_real_, rank = NA_integer_, n = length(population)))
+  }
+  better <- if (higher_is_better) sum(population > value) else sum(population < value)
+  list(
+    pct  = 100 * mean(if (higher_is_better) population <= value else population >= value),
+    rank = as.integer(better + 1),
+    n    = length(population)
+  )
+}
+
+build_percentile_table <- function(baseline, target_row) {
+  if (is.null(target_row) || nrow(target_row) == 0) return(tibble::tibble())
+
+  spec <- list(
+    list("Win Percentage", target_row$WinPct, baseline$WinPct, TRUE,
+         fmt_pct(target_row$WinPct, 1)),
+    list("Runs / Game", target_row$R_G, baseline$R_G, TRUE,
+         fmt(target_row$R_G, 2)),
+    list("Run Prevention", target_row$RA_G, baseline$RA_G, FALSE,
+         paste0(fmt(target_row$RA_G, 2), " RA/G")),
+    list("Run Differential / Game", target_row$RD_G, baseline$RD_G, TRUE,
+         fmt_signed(target_row$RD_G, 2))
+  )
+
+  purrr::map_dfr(spec, function(s) {
+    rp <- rank_and_percentile(s[[2]], s[[3]], s[[4]])
+    tibble::tibble(
+      Metric     = s[[1]],
+      Display    = s[[5]],
+      Percentile = rp$pct,
+      Rank       = rp$rank,
+      Pool       = rp$n
+    )
+  })
+}
+
+
+# ============================================================
+# 18. AUTOMATED FLAGS
+# ============================================================
+
+build_flags <- function(season_metrics, recent_metrics, team_rates,
+                        percentiles, thresholds, window_label) {
+  flags <- list()
+  add <- function(title, body, type = "info") {
+    flags[[length(flags) + 1]] <<- tibble::tibble(
+      Title = title, Body = body, Type = type
+    )
+  }
+
+  pct_of <- function(metric) {
+    if (nrow(percentiles) == 0) return(NA_real_)
+    row <- percentiles[percentiles$Metric == metric, , drop = FALSE]
+    if (nrow(row) == 0) NA_real_ else row$Percentile[[1]]
+  }
+  rank_text <- function(metric) {
+    if (nrow(percentiles) == 0) return("")
+    row <- percentiles[percentiles$Metric == metric, , drop = FALSE]
+    if (nrow(row) == 0 || is.na(row$Rank[[1]])) return("")
+    paste0(" (", row$Rank[[1]], " of ", row$Pool[[1]], " D-I teams)")
+  }
+
+  off <- pct_of("Runs / Game")
+  prev <- pct_of("Run Prevention")
+  diff <- pct_of("Run Differential / Game")
+
+  if (is.finite(off) && off >= thresholds$percentile_high) {
+    add("HIGH-END SCORING OFFENSE",
+        paste0("Scoring rate ranks in the ", round(off),
+               "th percentile nationally", rank_text("Runs / Game"), "."),
+        "danger")
+  }
+  if (is.finite(prev) && prev >= thresholds$percentile_high) {
+    add("STRONG RUN PREVENTION",
+        paste0("Runs allowed ranks in the ", round(prev),
+               "th percentile nationally", rank_text("Run Prevention"), "."),
+        "strength")
+  }
+  if (is.finite(diff) && diff >= thresholds$percentile_elite) {
+    add("COMPLETE TEAM PROFILE",
+        paste0("Run differential per game ranks in the ", round(diff),
+               "th percentile nationally", rank_text("Run Differential / Game"), "."),
+        "strength")
+  }
+
+  if (nrow(team_rates) > 0) {
+    r <- team_rates[1, ]
+    if (is.finite(r$HR_G) && r$HR_G >= thresholds$hr_per_game) {
+      add("POWER THREAT",
+          paste0(fmt(r$HR_G, 2), " home runs per game across ", window_label, "."),
+          "danger")
+    }
+    free <- sum(c(r$BB_G, r$HBP_G), na.rm = TRUE)
+    if (is.finite(free) && free >= thresholds$free_bases_per_game) {
+      add("FREE-BASE PRESSURE",
+          paste0(fmt(free, 1), " walks plus hit-by-pitches per game across ",
+                 window_label, "."),
+          "danger")
+    }
+    if (is.finite(r$SB_G) && r$SB_G >= thresholds$sb_per_game) {
+      add("ACTIVE RUNNING GAME",
+          paste0(fmt(r$SB_G, 2), " stolen bases per game across ", window_label, "."),
+          "info")
+    }
+    if (is.finite(r$SAC_G) && r$SAC_G >= thresholds$sac_per_game) {
+      add("BUNT ACTIVITY",
+          paste0(fmt(r$SAC_G, 2), " sacrifice hits per game across ", window_label, "."),
+          "info")
+    }
+    if (is.finite(r$K_G) && r$K_G >= thresholds$k_per_game) {
+      add("SWING-AND-MISS OPPORTUNITY",
+          paste0("The offense is striking out ", fmt(r$K_G, 1),
+                 " times per game across ", window_label, "."),
+          "opportunity")
+    }
+  }
+
+  if (nrow(season_metrics) > 0 && nrow(recent_metrics) > 0 &&
+      is.finite(season_metrics$WinPct[[1]]) && is.finite(recent_metrics$WinPct[[1]])) {
+    delta <- recent_metrics$WinPct[[1]] - season_metrics$WinPct[[1]]
+    if (delta >= thresholds$form_swing) {
+      add("TRENDING UP",
+          "Recent win rate is meaningfully above the full-season baseline.",
+          "strength")
+    }
+    if (delta <= -thresholds$form_swing) {
+      add("RECENT COOL-OFF",
+          "Recent win rate is meaningfully below the full-season baseline.",
+          "opportunity")
+    }
+  }
+
+  out <- dplyr::bind_rows(flags)
+  if (nrow(out) == 0) {
+    out <- tibble::tibble(
+      Title = "BALANCED PROFILE",
+      Body  = "No single tendency cleared the flag thresholds. Prepare to win individual matchups.",
+      Type  = "info"
+    )
+  }
+  out
+}
+
+
+# ============================================================
+# 19. GAME PLAN
+# ============================================================
+# Plan language is tied to a named player or a printed number
+# wherever the data supports it. Generic coaching filler was
+# removed - if the data does not support a point, the plan says
+# so instead of manufacturing one.
+
+build_game_plan <- function(percentiles, hitters_ranked, pitchers_ranked,
+                            staff_line, bullpen_usage, team_rates,
+                            season_metrics, recent_metrics, spray,
+                            situational_off, thresholds, window_label,
+                            hitter_rank_label = "Top three hitters",
+                            pitcher_rank_label = "Top three pitchers") {
+
+  pct_of <- function(metric) {
+    if (nrow(percentiles) == 0) return(NA_real_)
+    row <- percentiles[percentiles$Metric == metric, , drop = FALSE]
+    if (nrow(row) == 0) NA_real_ else row$Percentile[[1]]
+  }
+  off_pct  <- pct_of("Runs / Game")
+  prev_pct <- pct_of("Run Prevention")
+
+  # Top three hitters over the full season.
+  col_or_blank <- function(df, nm, default = "") {
+    if (nm %in% names(df)) df[[nm]] else rep(default, nrow(df))
+  }
+
+  top_hitter_lines <- if (nrow(hitters_ranked) == 0) {
+    "Not enough qualified hitters to rank."
+  } else {
+    hh <- dplyr::slice_head(hitters_ranked, n = 3)
+    hr_txt <- if ("HRText" %in% names(hh)) {
+      hh$HRText
+    } else {
+      paste0(ifelse(is.na(hh$HR), "—", hh$HR), " HR")
+    }
+    if (any(!is.na(hh$OPS))) {
+      paste0(
+        hh$Player, " — ", fmt_avg(hh$OPS), " OPS · ",
+        fmt_avg(hh$AVG), "/", fmt_avg(hh$OBP), "/", fmt_avg(hh$SLG),
+        " · ", hr_txt
+      )
+    } else {
+      paste0(
+        hh$Player, " — ", fmt_avg(col_or_blank(hh, "Reach", NA_real_)),
+        " reach · ", fmt_avg(col_or_blank(hh, "wAVG", NA_real_)), " AVG · ",
+        hr_txt
+      )
+    }
+  }
+
+  # Top three pitchers. Innings are on the line so the sample
+  # behind the rate is never hidden.
+  top_pitcher_lines <- if (nrow(pitchers_ranked) == 0) {
+    "No pitcher has thrown enough innings to rank on rate stats."
+  } else {
+    pp <- dplyr::slice_head(pitchers_ranked, n = 3)
+    ip_part <- if ("IPtxt" %in% names(pp)) paste0(" · ", pp$IPtxt, " IP") else ""
+    paste0(
+      pp$Player, " — ", fmt(pp$ERA, 2), " ERA · ", fmt(pp$WHIP, 2), " WHIP · ",
+      fmt(pp$K9, 1), " K/9", ip_part
+    )
+  }
+
+  offense_strengths <- character()
+  pitcher_counter   <- character()
+
+  if (is.finite(off_pct) && off_pct >= 70) {
+    offense_strengths <- c(offense_strengths, paste0(
+      "Run production grades in the ", round(off_pct),
+      "th percentile nationally."
+    ))
+    pitcher_counter <- c(pitcher_counter,
+      "Make the middle of the order hit with the bases empty. Free traffic in front of them is what turns a single into a crooked number.")
+  }
+
+  if (nrow(team_rates) > 0) {
+    r <- team_rates[1, ]
+    if (is.finite(r$HR_G) && r$HR_G >= thresholds$hr_per_game) {
+      offense_strengths <- c(offense_strengths, paste0(
+        "Power is real: ", fmt(r$HR_G, 2), " HR per game across ", window_label, "."
+      ))
+      pitcher_counter <- c(pitcher_counter,
+        "With traffic on, prioritize damage prevention over the punchout. Miss down, not over the middle.")
+    }
+    free <- sum(c(r$BB_G, r$HBP_G), na.rm = TRUE)
+    if (is.finite(free) && free >= 4.0) {
+      offense_strengths <- c(offense_strengths, paste0(
+        "They reach without the ball in play: ", fmt(free, 1),
+        " BB + HBP per game across ", window_label, "."
+      ))
+      pitcher_counter <- c(pitcher_counter,
+        "Win strike one. Their on-base profile is built on counts, not on barrels.")
+    }
+    if (is.finite(r$SB_G) && r$SB_G >= thresholds$sb_per_game) {
+      offense_strengths <- c(offense_strengths, paste0(
+        "Active running game: ", fmt(r$SB_G, 2), " stolen bases per game."
+      ))
+      pitcher_counter <- c(pitcher_counter,
+        "Vary looks and hold times with the identified runners on base; get the catcher a chance.")
+    }
+  }
+
+  # Situational tell: do they hit better or worse with RISP?
+  if (nrow(situational_off) > 0) {
+    all_row  <- situational_off[situational_off$Split == "All plate appearances", ]
+    risp_row <- situational_off[situational_off$Split == "Runners in scoring position", ]
+    if (nrow(all_row) == 1 && nrow(risp_row) == 1 &&
+        is.finite(all_row$OB) && is.finite(risp_row$OB) && risp_row$PA >= 25) {
+      gap <- risp_row$OB - all_row$OB
+      if (gap >= 0.04) {
+        offense_strengths <- c(offense_strengths, paste0(
+          "They get better with runners on: ", fmt_pct(risp_row$OB),
+          " on-base with RISP vs ", fmt_pct(all_row$OB), " overall (",
+          risp_row$PA, " PA)."
+        ))
+        pitcher_counter <- c(pitcher_counter,
+          "Clean innings matter more than usual against this group. Do not let two-out traffic turn into a rally.")
+      } else if (gap <= -0.04) {
+        pitcher_counter <- c(pitcher_counter, paste0(
+          "They have come up small with runners on (", fmt_pct(risp_row$OB),
+          " on-base with RISP vs ", fmt_pct(all_row$OB),
+          " overall). Pitching out of traffic is a live option rather than a panic."
+        ))
+      }
+    }
+  }
+
+  if (length(offense_strengths) == 0) {
+    offense_strengths <- "No single offensive trait cleared the thresholds in this window. Treat the lineup as balanced and attack hitter by hitter."
+  }
+  if (length(pitcher_counter) == 0) {
+    pitcher_counter <- "Win strike one, keep the bases clean, and make their best three hitters beat you without help."
+  }
+
+  pitching_strengths <- character()
+  pitching_weakness  <- character()
+  hitter_attack      <- character()
+
+  staff <- if (nrow(staff_line) > 0) staff_line[1, ] else
+    tibble::tibble(ERA = NA_real_, K9 = NA_real_, BB9 = NA_real_)
+
+  if (is.finite(prev_pct) && prev_pct >= 70) {
+    pitching_strengths <- c(pitching_strengths, paste0(
+      "Run prevention grades in the ", round(prev_pct), "th percentile nationally."
+    ))
+    hitter_attack <- c(hitter_attack,
+      "Scoring chances will be scarce. Do not give away outs once we create traffic.")
+  }
+  if (is.finite(staff$K9) && staff$K9 >= thresholds$staff_k9_good) {
+    pitching_strengths <- c(pitching_strengths, paste0(
+      "The staff misses bats: ", fmt(staff$K9, 1), " K/9 across ", window_label, "."
+    ))
+    hitter_attack <- c(hitter_attack,
+      "Shrink the zone with two strikes and make them throw a competitive finish pitch.")
+  }
+  if (is.finite(staff$WHIP) && staff$WHIP <= thresholds$staff_whip_good) {
+    pitching_strengths <- c(pitching_strengths, paste0(
+      "They keep the bases clean: ", fmt(staff$WHIP, 2), " WHIP across ",
+      window_label, "."
+    ))
+    hitter_attack <- c(hitter_attack,
+      "Traffic will not come for free. Taking the extra base and moving runners matters more than usual.")
+  }
+  if (is.finite(staff$WHIP) && staff$WHIP >= thresholds$staff_whip_loose) {
+    pitching_weakness <- c(pitching_weakness, paste0(
+      "They put runners on: ", fmt(staff$WHIP, 2), " WHIP across ", window_label, "."
+    ))
+    hitter_attack <- c(hitter_attack,
+      "Baserunners are there to be had. Keep the line moving and make them pitch out of traffic every inning.")
+  }
+  if (is.finite(staff$BB9) && staff$BB9 <= thresholds$staff_bb9_good) {
+    pitching_strengths <- c(pitching_strengths, paste0(
+      "They limit walks: ", fmt(staff$BB9, 1), " BB/9 across ", window_label, "."
+    ))
+  }
+  if (is.finite(staff$BB9) && staff$BB9 >= thresholds$staff_bb9_loose) {
+    pitching_weakness <- c(pitching_weakness, paste0(
+      "Control is an opening: ", fmt(staff$BB9, 1), " BB/9 across ", window_label, "."
+    ))
+    hitter_attack <- c(hitter_attack,
+      "Control the zone early and make them come back over the plate.")
+  }
+  if (is.finite(staff$K9) && staff$K9 <= thresholds$staff_k9_soft) {
+    pitching_weakness <- c(pitching_weakness, paste0(
+      "Not a swing-and-miss staff: ", fmt(staff$K9, 1), " K/9 across ", window_label, "."
+    ))
+    hitter_attack <- c(hitter_attack,
+      "Put the ball in play with intent and make their defense execute repeatedly in an inning.")
+  }
+
+  if (nrow(season_metrics) > 0 && nrow(recent_metrics) > 0 &&
+      is.finite(season_metrics$RA_G[[1]]) && is.finite(recent_metrics$RA_G[[1]]) &&
+      recent_metrics$RA_G[[1]] >= season_metrics$RA_G[[1]] + 0.75) {
+    pitching_weakness <- c(pitching_weakness, paste0(
+      "Recent run prevention has slipped: ", fmt(recent_metrics$RA_G[[1]], 2),
+      " RA/G recently vs ", fmt(season_metrics$RA_G[[1]], 2), " for the season."
+    ))
+  }
+
+  heavy <- if (nrow(bullpen_usage) > 0 && "Status" %in% names(bullpen_usage)) {
+    sum(bullpen_usage$Status %in% c("HEAVY", "WATCH"), na.rm = TRUE)
+  } else 0
+
+  if (heavy >= 2) {
+    pitching_weakness <- c(pitching_weakness, paste0(
+      heavy, " relief arms are carrying elevated recent workload."
+    ))
+    hitter_attack <- c(hitter_attack,
+      "Make the starter work. Getting into the middle-relief portion of this staff early is worth a plan of its own.")
+  }
+
+  if (length(pitching_strengths) == 0) {
+    pitching_strengths <- "No dominant staff trait cleared the thresholds. Prepare to win individual pitcher matchups."
+  }
+  if (length(pitching_weakness) == 0) {
+    pitching_weakness <- "No statistical weakness cleared the thresholds in this window. The opening is traffic, long at-bats, and forcing them off their preferred usage."
+  }
+  if (length(hitter_attack) == 0) {
+    hitter_attack <- "Control the zone, avoid giving away outs, and create enough traffic to force them into secondary matchups."
+  }
+
+  list(
+    pitcher_plan = list(
+      strengths   = unique(offense_strengths),
+      counter     = unique(pitcher_counter),
+      top_title   = hitter_rank_label,
+      top_players = top_hitter_lines
+    ),
+    hitter_plan = list(
+      strengths   = unique(pitching_strengths),
+      weaknesses  = unique(pitching_weakness),
+      attack      = unique(hitter_attack),
+      top_title   = pitcher_rank_label,
+      top_players = top_pitcher_lines
+    )
+  )
+}
+```
+
+```{r html_helpers}
+# ============================================================
+# 20. HTML COMPONENTS
+# ============================================================
+
+metric_card <- function(label, value, subtitle = "", source = NULL) {
+  src <- if (is.null(source)) "" else
+    paste0('<div class="src-tag">', html_escape(source), '</div>')
+  paste0(
+    '<div class="metric-card">',
+      '<div class="metric-label">', html_escape(label), '</div>',
+      '<div class="metric-value">', html_escape(value), '</div>',
+      '<div class="metric-sub">', html_escape(subtitle), '</div>',
+      src,
+    '</div>'
+  )
+}
+
+insight_card <- function(title, body, type = "info", number = NULL) {
+  num <- if (is.null(number)) "" else
+    paste0('<div class="insight-number">', html_escape(number), '</div>')
+  paste0(
+    '<div class="insight-card ', html_escape(type), '">', num,
+      '<div>',
+        '<div class="insight-title">', html_escape(title), '</div>',
+        '<div class="insight-body">', html_escape(body), '</div>',
+      '</div>',
+    '</div>'
+  )
+}
+
+bullet_list_html <- function(items) {
+  if (length(items) == 0) return("")
+  paste0("<ul>", paste0("<li>", html_escape(items), "</li>", collapse = ""), "</ul>")
+}
+
+scouting_plan_card <- function(title, strength_title, strengths,
+                               response_title, response_items,
+                               top_title, top_players,
+                               weakness_title = NULL, weaknesses = NULL) {
+  weak <- if (is.null(weakness_title) || is.null(weaknesses)) "" else paste0(
+    '<div class="plan-subhead">', html_escape(weakness_title), '</div>',
+    bullet_list_html(weaknesses)
+  )
+  paste0(
+    '<div class="scouting-plan-card">',
+      '<div class="scouting-plan-title">', html_escape(title), '</div>',
+      '<div class="plan-subhead">', html_escape(strength_title), '</div>',
+      bullet_list_html(strengths), weak,
+      '<div class="plan-subhead">', html_escape(response_title), '</div>',
+      bullet_list_html(response_items),
+      '<div class="plan-subhead">', html_escape(top_title), '</div>',
+      '<div class="top-player-list">',
+        paste0('<div class="top-player-row">', html_escape(top_players),
+               '</div>', collapse = ""),
+      '</div>',
+    '</div>'
+  )
+}
+
+list_card <- function(title, subtitle, lines) {
+  paste0(
+    '<div class="scouting-plan-card">',
+      '<div class="scouting-plan-title">', html_escape(title), '</div>',
+      '<div class="list-card-sub">', html_escape(subtitle), '</div>',
+      '<div class="top-player-list">',
+        paste0('<div class="top-player-row">', html_escape(lines), '</div>',
+               collapse = ""),
+      '</div>',
+    '</div>'
+  )
+}
+
+percentile_card <- function(metric, display, percentile, rank = NA, pool = NA) {
+  width <- if (is.na(percentile)) 0 else max(0, min(100, percentile))
+  label <- if (is.na(percentile)) {
+    "Not enough comparable teams to rank"
+  } else if (is.na(rank)) {
+    paste0(round(percentile), "th percentile")
+  } else {
+    paste0(round(percentile), "th percentile · ", rank, " of ", pool, " D-I teams")
+  }
+  paste0(
+    '<div class="percentile-card">',
+      '<div class="percentile-top"><span>', html_escape(metric),
+        '</span><strong>', html_escape(display), '</strong></div>',
+      '<div class="percentile-track"><div class="percentile-fill" style="width:',
+        width, '%;"></div></div>',
+      '<div class="percentile-foot">', html_escape(label), '</div>',
+    '</div>'
+  )
+}
+
+# Horizontal left / center / right distribution bar for spray.
+# Vectorized: this is called inside a mutate() over a whole column.
+spray_bar <- function(left_pct, center_pct, right_pct) {
+  seg <- function(cls, pct) {
+    if (is.na(pct) || pct <= 0) return("")
+    paste0('<div class="spray-seg ', cls, '" style="width:', round(100 * pct, 1),
+           '%;">', round(100 * pct), '</div>')
+  }
+  mapply(function(l, c_, r) {
+    if (is.na(l) && is.na(c_) && is.na(r)) {
+      return('<span class="muted-inline">—</span>')
+    }
+    paste0(
+      '<div class="spray-bar">',
+        seg("spray-left", l), seg("spray-center", c_), seg("spray-right", r),
+      '</div>'
+    )
+  }, left_pct, center_pct, right_pct, USE.NAMES = FALSE)
+}
+
+source_note <- function(...) {
+  paste0('<div class="source-note">', paste0(...), '</div>')
+}
+
+callout <- function(...) {
+  paste0('<div class="callout">', paste0(...), '</div>')
+}
+
+ar_table <- function(df, escape = TRUE) {
+  if (is.null(df) || nrow(df) == 0) {
+    return(callout("No rows available for this table with the current data."))
+  }
+  knitr::kable(
+    df, format = "html", escape = escape, row.names = FALSE,
+    table.attr = 'class="advance-table"'
+  )
+}
+
+status_html <- function(x) {
+  dplyr::case_when(
+    x == "HEAVY" ~ '<span class="status-heavy">HEAVY</span>',
+    x == "WATCH" ~ '<span class="status-watch">WATCH</span>',
+    TRUE         ~ '<span class="status-fresh">FRESH</span>'
+  )
+}
+
+projection_html <- function(x) {
+  dplyr::case_when(
+    x == "Likely"   ~ '<span class="status-heavy">LIKELY</span>',
+    x == "Possible" ~ '<span class="status-watch">POSSIBLE</span>',
+    TRUE            ~ '<span class="status-fresh">UNLIKELY</span>'
+  )
+}
+```
+
+```{r pull_team}
+# ============================================================
+# 21. PULL: TEAM IDENTITY
+# ============================================================
+
+teams <- cache_get(
+  "espn_teams",
+  function() baseballr::espn_college_baseball_teams(),
+  refresh = REFRESH_DATA,
+  fallback = tibble::tibble(),
+  source = "ESPN", label = "team index"
+)
+
+if (is.null(teams) || nrow(teams) == 0) {
+  stop("Could not retrieve the ESPN college baseball team list.", call. = FALSE)
+}
+
+teams_clean <- janitor::clean_names(teams)
+team_row    <- resolve_team(TEAM_QUERY, teams)
+
+TEAM_ID     <- as.character(team_row$team_id[[1]])
+TEAM_NAME   <- safe_first(team_row$display_name, TEAM_QUERY)
+TEAM_ABBREV <- safe_first(team_row$abbreviation, TEAM_QUERY)
+
+PRIMARY_HEX    <- clean_hex(team_row$color, "17324D")
+SECONDARY_HEX  <- clean_hex(team_row$alternate_color, "D9A441")
+PRIMARY_COLOR  <- paste0("#", PRIMARY_HEX)
+SECONDARY_COLOR <- paste0("#", SECONDARY_HEX)
+PRIMARY_TEXT   <- contrast_text(PRIMARY_HEX)
+SECONDARY_TEXT <- contrast_text(SECONDARY_HEX)
+
+TEAM_SLUG <- slugify(paste(SEASON, TEAM_ABBREV))
+LOGO_FILE <- cache_logo(
+  safe_first(team_row$logo, NA_character_), TEAM_SLUG, refresh = REFRESH_DATA
+)
+LOGO_URI <- file_to_data_uri(LOGO_FILE)
+
+D1_TEAM_IDS <- as.character(teams_clean$team_id)
+```
+
+```{r pull_schedule}
+# ============================================================
+# 22. PULL: SCHEDULE, RECORD, FORM
+# ============================================================
+
+schedule <- pull_team_schedule(TEAM_ID, SEASON, refresh = REFRESH_DATA)
+
+if (nrow(schedule) == 0) {
+  stop(
+    "ESPN returned no ", SEASON, " baseball schedule events for ", TEAM_NAME, ".",
+    call. = FALSE
+  )
+}
+
+CONFERENCE <- espn_conference(TEAM_ID, SEASON, refresh = REFRESH_DATA)
+
+schedule <- schedule |>
+  dplyr::mutate(d1_opponent = opponent_id %in% D1_TEAM_IDS) |>
+  mark_conference_games(CONFERENCE$members, TEAM_ID) |>
+  add_series_slot()
+
+completed <- schedule |>
+  dplyr::filter(completed, !is.na(team_score_num), !is.na(opponent_score_num)) |>
+  dplyr::arrange(game_date, game_datetime)
+
+if (nrow(completed) == 0) {
+  stop(
+    "ESPN returned the ", SEASON, " schedule for ", TEAM_NAME,
+    " but no final scores could be parsed. Delete the cache/ folder and Knit ",
+    "again with REFRESH_DATA <- TRUE.",
+    call. = FALSE
+  )
+}
+
+AS_OF_DATE <- max(completed$game_date, na.rm = TRUE)
+
+upcoming <- schedule |>
+  dplyr::filter(!completed, !is.na(game_date), game_date > AS_OF_DATE) |>
+  dplyr::arrange(game_date, game_datetime)
+
+NEXT_GAME <- if (nrow(upcoming) > 0) {
+  upcoming[1, ]
+} else {
+  tibble::tibble(game_date = AS_OF_DATE + 5, series_slot = NA_real_,
+                 opponent_label = NA_character_, home_away = NA_character_)
+}
+PROJECTION_DATE <- NEXT_GAME$game_date[[1]]
+
+record_string <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return("0-0")
+  paste0(
+    sum(df$winner_clean %in% TRUE, na.rm = TRUE), "-",
+    sum(df$winner_clean %in% FALSE, na.rm = TRUE)
+  )
+}
+
+record_metrics <- function(df, label) {
+  if (is.null(df) || nrow(df) == 0) {
+    return(tibble::tibble(
+      Window = label, G = 0, W = 0, L = 0,
+      WinPct = NA_real_, R_G = NA_real_, RA_G = NA_real_, RD_G = NA_real_
+    ))
+  }
+  g  <- nrow(df)
+  rf <- sum(df$team_score_num, na.rm = TRUE)
+  ra <- sum(df$opponent_score_num, na.rm = TRUE)
+  tibble::tibble(
+    Window = label,
+    G = g,
+    W = sum(df$winner_clean %in% TRUE, na.rm = TRUE),
+    L = sum(df$winner_clean %in% FALSE, na.rm = TRUE),
+    WinPct = rate_per(sum(df$winner_clean %in% TRUE, na.rm = TRUE), g),
+    R_G  = rate_per(rf, g),
+    RA_G = rate_per(ra, g),
+    RD_G = rate_per(rf - ra, g)
+  )
+}
+
+TEAM_RECORD <- record_string(completed)
+conference_games <- dplyr::filter(completed, conference_game %in% TRUE)
+CONF_RECORD <- if (nrow(conference_games) > 0) record_string(conference_games) else "—"
+CONF_NAME   <- CONFERENCE$name %||% NA_character_
+CONF_LABEL  <- if (is.na(CONF_NAME)) "Conference" else CONF_NAME
+
+log_check(
+  "Conference record",
+  if (nrow(conference_games) > 0) "OK" else "UNAVAILABLE",
+  if (nrow(conference_games) > 0) {
+    paste0(
+      CONF_LABEL, ": ", CONF_RECORD, " across ", nrow(conference_games),
+      " games. ESPN's schedule feed carries no conference flag for college ",
+      "baseball, so conference games are identified by matching the opponent's ",
+      "team id against the ", length(CONFERENCE$members),
+      " teams in the conference standings - an id comparison, not a name match."
+    )
+  } else {
+    paste0(
+      "No conference games could be identified. ",
+      if (length(CONFERENCE$members) == 0) {
+        "The conference membership lookup returned nothing for this team."
+      } else {
+        "Membership resolved but no completed opponent matched it."
+      }
+    )
+  }
+)
+
+d1_games     <- dplyr::filter(completed, d1_opponent %in% TRUE)
+non_d1_games <- dplyr::filter(completed, !(d1_opponent %in% TRUE))
+D1_RECORD    <- record_string(d1_games)
+NON_D1_N     <- nrow(non_d1_games)
+
+season_metrics <- record_metrics(completed, "Season")
+
+last_n <- function(df, n) {
+  df |>
+    dplyr::arrange(dplyr::desc(game_date), dplyr::desc(game_datetime)) |>
+    dplyr::slice_head(n = min(n, nrow(df))) |>
+    dplyr::arrange(game_date)
+}
+
+last10 <- last_n(completed, RECENT_GAMES)
+last5  <- last_n(completed, 5)
+
+recent_metrics <- record_metrics(last10, paste0("Last ", nrow(last10)))
+last5_metrics  <- record_metrics(last5,  paste0("Last ", nrow(last5)))
+d1_metrics     <- record_metrics(d1_games, "vs Division I")
+
+recent_comparison <- dplyr::bind_rows(
+  season_metrics, recent_metrics, last5_metrics, d1_metrics
+)
+
+one_run_games <- dplyr::filter(
+  completed, abs(team_score_num - opponent_score_num) == 1
+)
+ONE_RUN_RECORD <- record_string(one_run_games)
+
+log_check(
+  "Schedule parsed",
+  "OK",
+  paste0(nrow(completed), " completed games, ", nrow(upcoming), " scheduled ahead.")
+)
+log_check(
+  "Opponent division",
+  if (NON_D1_N == 0) "OK" else "NOTE",
+  if (NON_D1_N == 0) {
+    "Every completed opponent appears in the ESPN Division I team index."
+  } else {
+    paste0(
+      NON_D1_N, " of ", nrow(completed),
+      " completed games came against opponents not listed in the ESPN D-I index. ",
+      "Season rate stats include those games."
+    )
+  }
+)
+```
+
+```{r pull_detail}
+# ============================================================
+# 23. PULL: DETAILED GAMES + COVERAGE ACCOUNTING
+# ============================================================
+# Requested games and retrieved games are tracked separately.
+# Every window label in the report uses the number of games that
+# actually came back, never the number that were asked for.
+
+detail_schedule <- last_n(completed, DETAIL_GAMES)
+REQUESTED_GAMES <- nrow(detail_schedule)
+
+progress("ESPN: loading ", nrow(detail_schedule), " game files...")
+game_bundles <- lapply(seq_len(nrow(detail_schedule)), function(i) {
+  gid <- detail_schedule$event_id[[i]]
+  progress("  game ", i, "/", nrow(detail_schedule), " (", gid, ")")
+  get_game_bundle(gid, refresh = REFRESH_DATA)
+})
+names(game_bundles) <- detail_schedule$event_id
+
+component_rows <- function(bundle, component) {
+  if (is.null(bundle) || !is.list(bundle) || is.null(names(bundle))) return(0L)
+  idx <- which(tolower(names(bundle)) == tolower(component))
+  if (length(idx) == 0) return(0L)
+  n_rows(bundle[[idx[[1]]]])
+}
+
+coverage <- tibble::tibble(
+  event_id = detail_schedule$event_id,
+  Date     = detail_schedule$game_date,
+  Opponent = detail_schedule$opponent_label,
+  TeamRows   = vapply(game_bundles, component_rows, integer(1), "Team"),
+  PlayerRows = vapply(game_bundles, component_rows, integer(1), "Player"),
+  PlayRows   = vapply(game_bundles, component_rows, integer(1), "Plays")
+) |>
+  dplyr::mutate(
+    Box = PlayerRows > 0,
+    PBP = PlayRows > 0
+  )
+
+BOX_GAMES <- sum(coverage$Box)
+PBP_GAMES <- sum(coverage$PBP)
+
+WINDOW_LABEL     <- paste0("the last ", BOX_GAMES, " games")
+WINDOW_LABEL_CAP <- paste0("Last ", BOX_GAMES, " games")
+PBP_LABEL        <- paste0("the last ", PBP_GAMES, " games with play-by-play")
+
+log_check(
+  "Box-score coverage",
+  if (BOX_GAMES == REQUESTED_GAMES) "OK" else "PARTIAL",
+  paste0(BOX_GAMES, " of ", REQUESTED_GAMES,
+         " requested games returned a player box score.")
+)
+log_check(
+  "Play-by-play coverage",
+  if (PBP_GAMES == REQUESTED_GAMES) "OK" else "PARTIAL",
+  paste0(PBP_GAMES, " of ", REQUESTED_GAMES,
+         " requested games returned play-by-play.")
+)
+
+team_boxes   <- bind_game_component(game_bundles, "Team")
+player_boxes <- bind_game_component(game_bundles, "Player")
+plays_raw    <- bind_game_component(game_bundles, "Plays")
+
+# Resolve player identity once, before anything is grouped, so the
+# same person cannot appear twice under two spellings or two ids.
+identity_map <- build_identity_map(player_boxes)
+
+bat_rows <- espn_batting_rows(player_boxes, TEAM_ID, identity_map)
+pit_rows <- espn_pitching_rows(player_boxes, TEAM_ID, identity_map)
+
+merged_ids   <- if (nrow(identity_map) == 0) 0L else
+  sum(identity_map$id_variants > 1, na.rm = TRUE)
+merged_names <- if (nrow(identity_map) == 0) 0L else
+  sum(identity_map$name_variants > 1, na.rm = TRUE)
+
+log_check(
+  "Player identity",
+  if (merged_ids == 0 && merged_names == 0) "OK" else "MERGED",
+  if (merged_ids == 0 && merged_names == 0) {
+    "Every player appeared under one id and one spelling across the window."
+  } else {
+    paste0(
+      merged_names, " players appeared under more than one spelling of their ",
+      "name (usually a middle initial present in some box scores and not ",
+      "others) and ", merged_ids, " under more than one ESPN athlete id. ",
+      "Those were merged into one player before any totals were computed, so ",
+      "the same person is not split across two rows."
+    )
+  }
+)
+
+# Roster lookup used to attribute play-by-play events. Both teams
+# are included so an opposing fielder's name can never be mistaken
+# for the player who did the thing.
+roster <- if (nrow(identity_map) == 0) tibble::tibble() else {
+  identity_map |>
+    dplyr::transmute(
+      athlete_id = canonical_id,
+      Player,
+      team_id,
+      key
+    ) |>
+    dplyr::filter(!is.na(key), !is.na(athlete_id)) |>
+    dplyr::distinct(athlete_id, .keep_all = TRUE)
+}
+
+dup_keys <- if (nrow(roster) == 0) 0L else sum(duplicated(roster$key))
+if (nrow(roster) > 0) {
+  roster <- dplyr::distinct(roster, key, .keep_all = TRUE)
+}
+log_check(
+  "Player name keys unique",
+  if (dup_keys == 0) "OK" else "NOTE",
+  if (dup_keys == 0) {
+    "No name collisions between the two rosters in this window."
+  } else {
+    paste0(
+      dup_keys, " players on opposing rosters normalize to the same name; ",
+      "the first was kept. Play-by-play attribution for those players may be shared."
+    )
+  }
+)
+```
+
+```{r pull_ncaa}
+# ============================================================
+# 24. PULL: NCAA SEASON STATS + RECONCILIATION
+# ============================================================
+
+ncaa_batting  <- tibble::tibble()
+ncaa_pitching <- tibble::tibble()
+NCAA_TEAM_NAME <- NA_character_
+NCAA_OK <- FALSE
+
+NCAA_BUDGET_HIT <- FALSE
+NCAA_NO_ID      <- FALSE
+NCAA_ID_SOURCE  <- ""
+
+if (isTRUE(USE_NCAA)) {
+  ncaa_started <- Sys.time()
+  budget_left  <- function() {
+    as.numeric(difftime(Sys.time(), ncaa_started, units = "secs")) <
+      NCAA_BUDGET_SECONDS
+  }
+
+  # A working id, once found, is remembered. Nothing below has to
+  # run again on later renders for the same team and season.
+  id_key <- c("ncaa_working_id", slugify(TEAM_QUERY), SEASON, NCAA_DIVISION)
+  sticky <- if (isTRUE(REFRESH_DATA)) NULL else cache_peek(id_key)
+
+  candidates <- character()
+  cand_note  <- ""
+
+  if (!is.na(NCAA_TEAM_ID) && nzchar(NCAA_TEAM_ID)) {
+    candidates <- as.character(NCAA_TEAM_ID)
+    cand_note  <- "id set in the settings block"
+    progress("NCAA: using the team id from the settings block")
+  } else if (!is.null(sticky) && nzchar(sticky)) {
+    candidates <- sticky
+    cand_note  <- "id remembered from an earlier render"
+    progress("NCAA: reusing the team id that worked last time")
+  } else {
+    progress("NCAA: looking up the team id...")
+    found <- ncaa_candidate_ids(
+      TEAM_QUERY, TEAM_NAME, TEAM_ABBREV, SEASON, NCAA_DIVISION,
+      allow_scrape = NCAA_ALLOW_INDEX_SCRAPE, refresh = REFRESH_DATA
+    )
+    candidates     <- found$ids
+    NCAA_TEAM_NAME <- found$name
+    cand_note <- if (length(found$sources) == 0) "" else
+      paste(unique(found$sources), collapse = ", ")
+    progress("NCAA: ", length(candidates), " candidate id(s) found")
+  }
+
+  NCAA_ID_SOURCE <- cand_note
+
+  if (length(candidates) == 0) {
+    NCAA_NO_ID <- TRUE
+  } else {
+    ncaa_id <- NA_character_
+    for (cand in candidates) {
+      if (!budget_left()) {
+        NCAA_BUDGET_HIT <- TRUE
+        break
+      }
+      progress("NCAA: trying season batting for id ", cand, "...")
+      attempt <- build_ncaa_batting(
+        pull_ncaa_stats(cand, SEASON, "batting", REFRESH_DATA)
+      )
+      if (nrow(attempt) > 0) {
+        ncaa_batting <- attempt
+        ncaa_id <- cand
+        break
+      }
+    }
+
+    if (!is.na(ncaa_id) && budget_left()) {
+      progress("NCAA: pulling season pitching...")
+      ncaa_pitching <- build_ncaa_pitching(
+        pull_ncaa_stats(ncaa_id, SEASON, "pitching", REFRESH_DATA)
+      )
+    }
+
+    NCAA_OK <- nrow(ncaa_batting) > 0
+
+    if (NCAA_OK) {
+      cache_poke(id_key, ncaa_id)
+    } else if (!NCAA_BUDGET_HIT) {
+      # A remembered id that stops working is worse than none.
+      cache_forget(id_key)
+    }
+  }
+
+  progress(
+    "NCAA: finished in ",
+    round(as.numeric(difftime(Sys.time(), ncaa_started, units = "secs"))),
+    "s (", if (NCAA_OK) "ok" else "unavailable", ")"
+  )
+}
+
+log_check(
+  "NCAA official stats",
+  if (!isTRUE(USE_NCAA)) "SKIPPED" else if (NCAA_OK) "OK" else "UNAVAILABLE",
+  if (!isTRUE(USE_NCAA)) {
+    "USE_NCAA is FALSE. Season rate stats fall back to ESPN season-to-date values."
+  } else if (NCAA_OK) {
+    paste0("Matched to '", NCAA_TEAM_NAME, "'",
+           if (nzchar(NCAA_ID_SOURCE)) paste0(" via ", NCAA_ID_SOURCE) else "",
+           ". ", nrow(ncaa_batting), " hitters and ", nrow(ncaa_pitching),
+           " pitchers loaded.")
+  } else if (NCAA_NO_ID) {
+    paste0(
+      "No stats.ncaa.org team id could be found for '", TEAM_QUERY,
+      "' in the lookup tables bundled with baseballr, and the live index ",
+      "scrape is switched off because it takes minutes and frequently times ",
+      "out. To turn this section on, open the team on stats.ncaa.org, copy the ",
+      "number from the URL, and set NCAA_TEAM_ID in the settings block. Season ",
+      "slash lines meanwhile come from ESPN's season-to-date snapshot, which is ",
+      "a snapshot, not an official total."
+    )
+  } else if (NCAA_BUDGET_HIT) {
+    paste0(
+      "The NCAA pull exceeded its ", NCAA_BUDGET_SECONDS, "-second budget and was ",
+      "cut short so the render could finish. stats.ncaa.org throttles heavily. ",
+      "Season slash lines fall back to the most recent ESPN season-to-date value, ",
+      "which is a snapshot, not an official total. Re-knitting usually succeeds, ",
+      "and once it does the result is cached."
+    )
+  } else {
+    paste0(
+      "stats.ncaa.org did not return usable data. Season slash lines fall back ",
+      "to the most recent ESPN season-to-date value, which is a snapshot, not ",
+      "an official total."
+    )
+  }
+)
+
+# ESPN carries a running season-to-date slash line in each box
+# score. Comparing the last one against the official NCAA totals
+# is a direct test of whether the two sources agree.
+espn_std <- if (nrow(bat_rows) == 0) tibble::tibble() else {
+  bat_rows |>
+    dplyr::arrange(athlete_id, game_date) |>
+    dplyr::group_by(athlete_id, Player) |>
+    dplyr::summarise(
+      e_avg = last_non_na(std_avg),
+      e_obp = last_non_na(std_obp),
+      e_slg = last_non_na(std_slg),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(key = norm_person_key(Player))
+}
+
+reconciliation <- tibble::tibble()
+if (NCAA_OK && nrow(espn_std) > 0) {
+  reconciliation <- espn_std |>
+    dplyr::inner_join(
+      dplyr::select(ncaa_batting, key, n_avg = AVG, n_obp = OBP, n_slg = SLG, n_pa = PA),
+      by = "key"
+    ) |>
+    dplyr::mutate(
+      d_avg = abs(e_avg - n_avg),
+      d_obp = abs(e_obp - n_obp),
+      d_slg = abs(e_slg - n_slg),
+      MaxGap = pmax(d_avg, d_obp, d_slg, na.rm = TRUE)
+    ) |>
+    dplyr::arrange(dplyr::desc(MaxGap))
+
+  matched   <- nrow(reconciliation)
+  unmatched <- nrow(espn_std) - matched
+  big_gaps  <- sum(reconciliation$MaxGap > 0.030, na.rm = TRUE)
+
+  log_check(
+    "ESPN vs NCAA slash lines",
+    if (big_gaps == 0) "OK" else "REVIEW",
+    paste0(
+      matched, " hitters matched by name (", unmatched, " unmatched). ",
+      big_gaps, " differ by more than 30 points on at least one rate stat. ",
+      "The report uses the NCAA figure where the two disagree."
+    )
+  )
+}
+```
+
+```{r build_tables}
+# ============================================================
+# 25. BUILD: DERIVED TABLES
+# ============================================================
+
+batting_window  <- build_batting_window(bat_rows, WINDOW_LABEL_CAP)
+pitching_window <- build_pitching_window(pit_rows, WINDOW_LABEL_CAP)
+expected_lineup <- build_expected_lineup(bat_rows)
+
+rotation_projection <- build_rotation_projection(pit_rows, completed, NEXT_GAME)
+bullpen_usage       <- build_bullpen_usage(pit_rows, AS_OF_DATE)
+role_splits         <- pitcher_role_splits(pit_rows, completed)
+workload            <- starter_workload(pit_rows)
+
+team_rate_out <- build_team_rates(team_boxes, TEAM_ID)
+team_rates    <- team_rate_out$rates
+
+if (nzchar(team_rate_out$missing)) {
+  log_check(
+    "Team box-score fields",
+    "PARTIAL",
+    paste0("Not published by ESPN for these games: ", team_rate_out$missing,
+           ". Those rows show a dash rather than a zero.")
+  )
+}
+
+# Window-level staff line, computed from summed counting stats.
+staff_line <- if (nrow(pit_rows) == 0) {
+  tibble::tibble(IP = NA_real_, ERA = NA_real_, WHIP = NA_real_,
+                 K9 = NA_real_, BB9 = NA_real_)
+} else {
+  outs <- sum(pit_rows$Outs, na.rm = TRUE)
+  ip   <- outs_to_ip_num(outs)
+  tibble::tibble(
+    IP   = ip,
+    ERA  = rate_per(sum(pit_rows$ER, na.rm = TRUE), ip, 9),
+    WHIP = rate_per(
+      sum(pit_rows$BB, na.rm = TRUE) + sum(pit_rows$H, na.rm = TRUE), ip
+    ),
+    K9   = rate_per(sum(pit_rows$K,  na.rm = TRUE), ip, 9),
+    BB9  = rate_per(sum(pit_rows$BB, na.rm = TRUE), ip, 9)
+  )
+}
+
+# ---- Play-by-play derived ---------------------------------
+events     <- parse_pbp(plays_raw, TEAM_ID, roster, completed)
+run_ledger <- build_run_ledger(plays_raw, TEAM_ID, completed)
+
+spray            <- build_spray(events, TEAM_ID)
+hitter_splits    <- build_hitter_splits(events)
+situational_off  <- build_team_situational(events, "offense")
+situational_def  <- build_team_situational(events, "defense")
+running_game     <- build_running_game(events, PBP_GAMES)
+coverage_pbp     <- pbp_coverage(events)
+
+# Internal consistency test: runs recovered from the play text
+# against the final scores ESPN reported for the same games.
+pbp_runs_check <- tibble::tibble()
+if (nrow(run_ledger) > 0) {
+  pbp_runs <- run_ledger |>
+    dplyr::group_by(game_id) |>
+    dplyr::summarise(PBP_Runs = sum(FocalRuns, na.rm = TRUE), .groups = "drop")
+
+  pbp_runs_check <- completed |>
+    dplyr::select(game_id = event_id, Box_Runs = team_score_num) |>
+    dplyr::inner_join(pbp_runs, by = "game_id") |>
+    dplyr::mutate(Match = PBP_Runs == Box_Runs)
+
+  if (nrow(pbp_runs_check) > 0) {
+    agree <- mean(pbp_runs_check$Match, na.rm = TRUE)
+    log_check(
+      "Scoreboard reconstruction",
+      if (agree >= 0.95) "OK" else if (agree >= 0.80) "REVIEW" else "POOR",
+      paste0(
+        "Runs rebuilt from the play-by-play scoreboard match the final score in ",
+        fmt_pct(agree), " of ", nrow(pbp_runs_check),
+        " games. This is what the Scoring by Inning chart is built from."
+      )
+    )
+  }
+}
+
+# A separate and genuinely independent test: how many of the runs
+# actually scored are NAMED in the play text. This does not touch
+# the score columns, so it cannot validate itself against the check
+# above - it measures whether the text parser is seeing the game.
+# It is expected to fall short of 100%: a run scored on a wild pitch
+# or a balk is written under the pitcher's name, not the runner's.
+TEXT_RUN_RECOVERY <- NA_real_
+if (nrow(events) > 0 && "text_runs" %in% names(events)) {
+  text_runs_by_game <- events |>
+    dplyr::filter(is_focal) |>
+    dplyr::group_by(game_id) |>
+    dplyr::summarise(TextRuns = sum(text_runs, na.rm = TRUE), .groups = "drop")
+
+  text_cmp <- completed |>
+    dplyr::select(game_id = event_id, Box_Runs = team_score_num) |>
+    dplyr::inner_join(text_runs_by_game, by = "game_id")
+
+  if (nrow(text_cmp) > 0 && sum(text_cmp$Box_Runs, na.rm = TRUE) > 0) {
+    TEXT_RUN_RECOVERY <- sum(text_cmp$TextRuns, na.rm = TRUE) /
+      sum(text_cmp$Box_Runs, na.rm = TRUE)
+
+    log_check(
+      "Runs named in the play text",
+      if (is.finite(TEXT_RUN_RECOVERY) && TEXT_RUN_RECOVERY >= 0.90) "OK"
+      else if (is.finite(TEXT_RUN_RECOVERY) && TEXT_RUN_RECOVERY >= 0.75) "REVIEW"
+      else "POOR",
+      paste0(
+        "The play text accounts for ", fmt_pct(TEXT_RUN_RECOVERY),
+        " of the runs this team actually scored across ", nrow(text_cmp),
+        " games. This is the real test of the text parse that the Spray & ",
+        "Splits tab depends on - falling a little short is normal, since runs ",
+        "scored on a wild pitch or balk are written under the pitcher's name."
+      )
+    )
+  }
+}
+
+# ---- Master hitter table ----------------------------------
+hitters <- batting_window |>
+  dplyr::mutate(key = norm_person_key(Player))
+
+if (NCAA_OK) {
+  hitters <- hitters |>
+    dplyr::left_join(
+      ncaa_batting |>
+        dplyr::select(key, s_G = G, s_PA = PA, s_AB = AB, s_AVG = AVG,
+                      s_OBP = OBP, s_SLG = SLG, s_OPS = OPS, s_ISO = ISO,
+                      s_HR = HR, s_BB = BB, s_K = K, s_SB = SB, s_CS = CS,
+                      s_BBpct = BBpct, s_Kpct = Kpct, s_Yr = Yr, s_Pos = NPos),
+      by = "key"
+    )
+} else {
+  hitters <- hitters |>
+    dplyr::left_join(
+      dplyr::select(espn_std, key, s_AVG = e_avg, s_OBP = e_obp, s_SLG = e_slg),
+      by = "key"
+    ) |>
+    dplyr::mutate(
+      s_G = NA_real_, s_PA = NA_real_, s_AB = NA_real_,
+      s_OPS = s_OBP + s_SLG, s_ISO = s_SLG - s_AVG,
+      s_HR = NA_real_, s_BB = NA_real_, s_K = NA_real_,
+      s_SB = NA_real_, s_CS = NA_real_,
+      s_BBpct = NA_real_, s_Kpct = NA_real_,
+      s_Yr = NA_character_, s_Pos = NA_character_
+    )
+}
+
+# Season list: full-season production, ranked on OPS. Qualifying
+# is season plate appearances; if there is no official season line
+# the whole window stands in for it and the card says so.
+hitters <- dplyr::mutate(
+  hitters,
+  Qualified = tidyr::replace_na(
+    if (NCAA_OK) !is.na(s_PA) & s_PA >= MIN_PA_SEASON else AB >= MIN_AB_WINDOW,
+    FALSE
+  )
+)
+
+hitters_ranked <- hitters |>
+  dplyr::filter(Qualified) |>
+  dplyr::mutate(
+    AVG = s_AVG, OBP = s_OBP, SLG = s_SLG, OPS = s_OPS,
+    # Home runs are the one counting stat on this card, and without
+    # the NCAA feed the only figure available is the window total.
+    # It is shown with its window attached rather than sitting
+    # unlabelled next to a season slash line.
+    HRText = dplyr::if_else(
+      is.na(s_HR),
+      paste0(HR, " HR (last ", BOX_GAMES, ")"),
+      paste0(s_HR, " HR")
+    ),
+    HR = dplyr::coalesce(s_HR, HR),
+    Kpct = dplyr::coalesce(s_Kpct, Kpct),
+    SortKey = dplyr::coalesce(s_OPS, Reach)
+  ) |>
+  dplyr::arrange(dplyr::desc(SortKey))
+
+# The label has to describe the numbers actually printed. When the
+# NCAA feed is down the slash line is still a SEASON figure - ESPN's
+# running season-to-date snapshot - so calling it "last 16 games"
+# was wrong in the one direction that matters.
+SEASON_SLASH_SOURCE <- dplyr::case_when(
+  NCAA_OK ~ "NCAA official season totals",
+  any(!is.na(hitters_ranked$OPS)) ~ "ESPN season-to-date snapshot",
+  TRUE ~ "recent window only"
+)
+
+HITTER_RANK_LABEL <- if (NCAA_OK) {
+  paste0("Top three hitters — season OPS, ", MIN_PA_SEASON, "+ PA")
+} else if (any(!is.na(hitters_ranked$OPS))) {
+  "Top three hitters — season-to-date OPS (ESPN snapshot, not official)"
+} else {
+  paste0("Top three hitters — last ", BOX_GAMES, " games, no season line available")
+}
+
+# ---- Master pitcher table ---------------------------------
+pitchers <- pitching_window |>
+  dplyr::mutate(key = norm_person_key(Player))
+
+if (nrow(ncaa_pitching) > 0) {
+  pitchers <- pitchers |>
+    dplyr::left_join(
+      ncaa_pitching |>
+        dplyr::select(key, s_App = App, s_GS = GS, s_IP = IP, s_ERA = ERA,
+                      s_K9 = K9, s_BB9 = BB9, s_H9 = H9, s_KBB = KBB,
+                      s_WHIP = WHIP, s_K = K, s_BB = BB),
+      by = "key"
+    )
+} else {
+  pitchers <- pitchers |>
+    dplyr::mutate(
+      s_App = NA_real_, s_GS = NA_real_, s_IP = NA_real_, s_ERA = NA_real_,
+      s_K9 = NA_real_, s_BB9 = NA_real_, s_H9 = NA_real_, s_KBB = NA_real_,
+      s_WHIP = NA_real_, s_K = NA_real_, s_BB = NA_real_
+    )
+}
+
+# Innings qualifier, scaled to games played. Season innings are
+# measured against the team's completed games; when there is no
+# season line the window is measured against the games in it.
+PITCHER_QUAL_SEASON <- max(
+  PITCHER_QUAL_IP_FLOOR, PITCHER_QUAL_IP_PER_GAME * nrow(completed)
+)
+PITCHER_QUAL_WINDOW <- max(3, PITCHER_QUAL_IP_PER_GAME * BOX_GAMES)
+
+pitchers <- pitchers |>
+  dplyr::mutate(
+    RankIP  = dplyr::coalesce(s_IP, IPnum),
+    QualBar = dplyr::if_else(!is.na(s_IP), PITCHER_QUAL_SEASON, PITCHER_QUAL_WINDOW)
+  )
+
+# If fewer than three arms clear the bar, halve it once rather than
+# print a one-man list. The card reports which bar was used.
+PITCHER_QUAL_RELAXED <- sum(pitchers$RankIP >= pitchers$QualBar, na.rm = TRUE) < 3
+if (PITCHER_QUAL_RELAXED) {
+  pitchers$QualBar <- pitchers$QualBar / 2
+}
+
+pitchers <- dplyr::mutate(
+  pitchers,
+  Qualified = tidyr::replace_na(RankIP >= QualBar, FALSE)
+)
+
+pitchers_ranked <- pitchers |>
+  dplyr::filter(Qualified %in% TRUE) |>
+  dplyr::mutate(
+    ERA  = dplyr::coalesce(s_ERA, ERA),
+    WHIP = dplyr::coalesce(s_WHIP, WHIP),
+    K9   = dplyr::coalesce(s_K9, K9),
+    BB9  = dplyr::coalesce(s_BB9, BB9),
+    IPtxt = outs_to_ip_chr(round(RankIP * 3))
+  ) |>
+  dplyr::arrange(ERA, WHIP, dplyr::desc(K9))
+
+PITCHER_QUAL_USED <- if (nrow(pitchers) == 0) NA_real_ else
+  suppressWarnings(min(pitchers$QualBar, na.rm = TRUE))
+
+PITCHER_USES_SEASON <- any(!is.na(pitchers$s_IP))
+
+PITCHER_RANK_LABEL <- if (!is.finite(PITCHER_QUAL_USED)) {
+  "Top three pitchers — ERA and WHIP"
+} else {
+  paste0(
+    "Top three pitchers — ",
+    if (PITCHER_USES_SEASON) "season" else paste0("last ", BOX_GAMES, " games"),
+    ", ERA and WHIP, ", fmt(PITCHER_QUAL_USED, 0), "+ IP",
+    if (PITCHER_QUAL_RELAXED) " (bar lowered)" else ""
+  )
+}
+
+# ---- Recent performers: a separate, shorter window ---------
+recent_perf_games <- coverage |>
+  dplyr::filter(Box) |>
+  dplyr::arrange(dplyr::desc(Date)) |>
+  dplyr::slice_head(n = RECENT_PERF_GAMES)
+
+RECENT_PERF_N <- nrow(recent_perf_games)
+RECENT_PERF_RANGE <- if (RECENT_PERF_N == 0) "" else {
+  paste0(
+    format(min(recent_perf_games$Date), "%b %d"), " – ",
+    format(max(recent_perf_games$Date), "%b %d")
+  )
+}
+
+recent_hitters  <- build_recent_hitters(
+  bat_rows, recent_perf_games$event_id, MIN_AB_RECENT
+)
+recent_pitchers <- build_recent_pitchers(
+  pit_rows, recent_perf_games$event_id, MIN_OUT_RECENT
+)
+
+RECENT_HITTER_LINES <- if (nrow(recent_hitters) == 0) {
+  paste0("No hitter reached ", MIN_AB_RECENT, " at-bats in this window.")
+} else {
+  rh <- dplyr::slice_head(recent_hitters, n = 3)
+  paste0(
+    rh$Player, " — ", fmt_avg(rh$Reach), " reach · ", fmt_avg(rh$AVG), " AVG · ",
+    rh$HR, " HR · ", rh$RBI, " RBI · ", rh$H, "-for-", rh$AB
+  )
+}
+
+RECENT_PITCHER_LINES <- if (nrow(recent_pitchers) == 0) {
+  paste0("No pitcher recorded ", MIN_OUT_RECENT, " outs in this window.")
+} else {
+  rp <- dplyr::slice_head(recent_pitchers, n = 3)
+  paste0(
+    rp$Player, " — ", fmt(rp$ERA, 2), " ERA · ", fmt(rp$WHIP, 2), " WHIP · ",
+    fmt(rp$K9, 1), " K/9 · ", rp$IP, " IP"
+  )
+}
+
+RECENT_SUBTITLE <- paste0(
+  "Last ", RECENT_PERF_N, " games",
+  if (nzchar(RECENT_PERF_RANGE)) paste0(" · ", RECENT_PERF_RANGE) else "",
+  ". Small samples on purpose — at-bats and innings are on every line."
+)
+
+RANK_METHOD_NOTE <- paste0(
+  "<strong>Season source: ", SEASON_SLASH_SOURCE, ".</strong> ",
+  if (!NCAA_OK) {
+    paste0(
+      "The official NCAA totals were unavailable for this render, so the season ",
+      "slash line is ESPN's running season-to-date value and home runs are the ",
+      "recent-window total, marked as such on each line. "
+    )
+  } else "",
+  "<strong>Season lists.</strong> Hitters are ranked on season OPS and need ",
+  MIN_PA_SEASON, "+ plate appearances. Pitchers are ranked on ERA, then WHIP, ",
+  "and must have thrown ", fmt(PITCHER_QUAL_USED, 0), "+ innings",
+  if (PITCHER_QUAL_RELAXED) {
+    " — the bar was halved because fewer than three arms cleared the full one"
+  } else {
+    paste0(" (", PITCHER_QUAL_IP_PER_GAME, " per team game)")
+  },
+  ", so a four-inning cameo cannot lead the staff on rate stats. ",
+  "<strong>Recent lists.</strong> The same three-deep view over the last ",
+  RECENT_PERF_N, " games only, ranked on reach rate for hitters (",
+  MIN_AB_RECENT, "+ AB) and ERA then WHIP for pitchers (", MIN_OUT_RECENT,
+  "+ outs). These are small samples by design — they answer who is going well ",
+  "right now, not who is good — so the at-bats and innings behind each rate are ",
+  "printed on the line. Read them next to the season lists, not instead of them."
+)
+
+# ---- Percentiles, flags, plan ------------------------------
+d1_baseline  <- build_d1_baseline(SEASON, refresh = REFRESH_DATA)
+d1_team_row  <- find_team_in_baseline(d1_baseline, TEAM_QUERY, TEAM_NAME, TEAM_ABBREV)
+percentiles  <- build_percentile_table(d1_baseline, d1_team_row)
+
+log_check(
+  "National baseline",
+  if (nrow(percentiles) > 0) "OK" else "UNAVAILABLE",
+  if (nrow(percentiles) > 0) {
+    paste0("Compared against ", percentiles$Pool[[1]],
+           " teams in the ESPN Division I standings feed.")
+  } else {
+    "The team could not be matched in the standings feed, so no national percentiles are shown."
+  }
+)
+
+flags <- build_flags(
+  season_metrics, recent_metrics, team_rates, percentiles,
+  THRESHOLDS, WINDOW_LABEL
+)
+
+game_plan <- build_game_plan(
+  percentiles, hitters_ranked, pitchers_ranked, staff_line, bullpen_usage,
+  team_rates, season_metrics, recent_metrics, spray, situational_off,
+  THRESHOLDS, WINDOW_LABEL,
+  hitter_rank_label  = HITTER_RANK_LABEL,
+  pitcher_rank_label = PITCHER_RANK_LABEL
+)
+
+recent_results <- completed |>
+  dplyr::arrange(dplyr::desc(game_date)) |>
+  dplyr::slice_head(n = min(10, nrow(completed))) |>
+  dplyr::transmute(
+    Date     = format(game_date, "%b %d"),
+    Opponent = opponent_label,
+    Site = dplyr::case_when(
+      neutral_site %in% TRUE ~ "N",
+      stringr::str_to_lower(home_away) == "home" ~ "H",
+      TRUE ~ "A"
+    ),
+    Slot   = slot_label,
+    Result = ifelse(winner_clean %in% TRUE, "W", "L"),
+    Score  = paste0(team_score_num, "-", opponent_score_num),
+    Conf   = ifelse(conference_game %in% TRUE, "Yes", "—"),
+    `D-I`  = ifelse(d1_opponent, "Yes", "No")
+  )
+
+season_row <- season_metrics[1, ]
+recent_row <- recent_metrics[1, ]
+
+logo_html <- if (!is.na(LOGO_URI)) {
+  paste0('<img class="hero-logo" src="', LOGO_URI, '" alt="',
+         html_escape(TEAM_NAME), ' logo">')
+} else {
+  paste0('<div class="hero-monogram">', html_escape(TEAM_ABBREV), '</div>')
+}
+```
+
+```{r css, results='asis'}
+# ============================================================
+# 26. STYLE
+# ============================================================
+# The report no longer relies on Bootstrap. The previous build
+# set theme: null, which strips Bootstrap out of the template -
+# and the .tabset feature and .nav-tabs / .main-container styling
+# it used all depend on Bootstrap being there. The tabs and the
+# page container silently did nothing. Everything below is
+# self-contained, so the knitted .html renders identically for
+# anyone who opens it, offline, with no CDN.
+
+cat(paste0('
+<style>
+:root {
+  --team-primary: ', PRIMARY_COLOR, ';
+  --team-secondary: ', SECONDARY_COLOR, ';
+  --team-primary-text: ', PRIMARY_TEXT, ';
+  --team-secondary-text: ', SECONDARY_TEXT, ';
+  --ink: #18232D;
+  --muted: #697783;
+  --background: #EDF1F4;
+  --soft: #F6F8FA;
+  --line: #E1E6EA;
+  --white: #FFFFFF;
+  --danger: #A13C35;
+  --strength: #306B55;
+  --opportunity: #896718;
+}
+
+html, body {
+  background: var(--background);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  font-size: 15px;
+  margin: 0;
+  padding: 0;
+  line-height: 1.5;
+}
+
+.ar-shell {
+  max-width: 1180px;
+  margin: 28px auto 60px auto;
+  background: var(--white);
+  padding: 0 42px 48px 42px;
+  border-radius: 18px;
+  box-shadow: 0 14px 42px rgba(28, 42, 54, .09);
+  overflow: hidden;
+}
+
+h1 { display: none; }
+
+h2 {
+  font-size: 24px; font-weight: 800; color: var(--ink);
+  margin: 30px 0 14px 0;
+}
+
+h3 {
+  font-size: 18px; font-weight: 800; color: var(--ink);
+  margin: 26px 0 10px 0;
+}
+
+.hero {
+  margin: 0 -42px 22px -42px;
+  padding: 40px 52px;
+  background: linear-gradient(
+    122deg,
+    var(--team-primary) 0%, var(--team-primary) 73%,
+    var(--team-secondary) 73%, var(--team-secondary) 100%
+  );
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 28px;
+  align-items: center;
+}
+
+.hero-logo-box {
+  width: 140px; height: 140px;
+  background: rgba(255,255,255,.97);
+  border-radius: 22px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 14px;
+  box-shadow: 0 10px 24px rgba(0,0,0,.12);
+}
+.hero-logo { max-width: 112px; max-height: 112px; object-fit: contain; }
+.hero-monogram { font-size: 38px; font-weight: 900; color: var(--team-primary); }
+
+.hero-kicker {
+  color: rgba(255,255,255,.78);
+  font-size: 11px; font-weight: 800; letter-spacing: 1.8px;
+  text-transform: uppercase; margin-bottom: 7px;
+}
+.hero-title {
+  color: var(--team-primary-text);
+  font-size: 40px; font-weight: 900; letter-spacing: -1px;
+  line-height: 1.04; margin-bottom: 9px;
+}
+.hero-subtitle {
+  color: rgba(255,255,255,.88);
+  font-size: 15px; font-weight: 600;
+}
+.hero-meta {
+  color: rgba(255,255,255,.72);
+  font-size: 12px; font-weight: 600; margin-top: 6px;
+}
+
+/* ---- Tabs (no Bootstrap, no jQuery) ---- */
+.tabbar {
+  display: flex; flex-wrap: wrap; gap: 2px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 22px;
+}
+.tabbtn {
+  appearance: none; background: transparent; border: none;
+  border-bottom: 3px solid transparent;
+  color: #677581; font-weight: 700; font-size: 14px;
+  padding: 12px 15px; cursor: pointer;
+  font-family: inherit;
+}
+.tabbtn:hover { color: var(--team-primary); }
+.tabbtn.is-active {
+  color: var(--team-primary);
+  border-bottom-color: var(--team-secondary);
+}
+.ar-panel.is-hidden { display: none; }
+
+.section-kicker {
+  color: var(--team-primary); text-transform: uppercase;
+  font-size: 10px; font-weight: 900; letter-spacing: 1.4px; margin-top: 8px;
+}
+.section-title {
+  color: var(--ink); font-size: 25px; font-weight: 900;
+  letter-spacing: -.4px; margin: 3px 0 15px 0;
+}
+
+.metric-grid {
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 11px; margin-bottom: 24px;
+}
+.metric-card {
+  border: 1px solid var(--line); border-top: 4px solid var(--team-secondary);
+  border-radius: 11px; background: #FFFFFF; padding: 15px; min-height: 112px;
+}
+.metric-label {
+  color: var(--muted); font-size: 10px; font-weight: 800;
+  text-transform: uppercase; letter-spacing: .8px;
+}
+.metric-value {
+  color: var(--team-primary); font-size: 26px; font-weight: 900;
+  line-height: 1; margin-top: 10px;
+}
+.metric-sub { color: var(--muted); font-size: 10px; line-height: 1.35; margin-top: 7px; }
+.src-tag {
+  margin-top: 8px; font-size: 9px; letter-spacing: .6px;
+  text-transform: uppercase; color: #94A2AD; font-weight: 700;
+}
+
+.insight-stack { display: grid; gap: 9px; margin-bottom: 22px; }
+.insight-card {
+  display: flex; gap: 13px; align-items: flex-start; background: #FFFFFF;
+  border: 1px solid var(--line); border-left: 5px solid var(--team-primary);
+  border-radius: 10px; padding: 14px 16px;
+}
+.insight-card.danger { border-left-color: var(--danger); }
+.insight-card.strength { border-left-color: var(--strength); }
+.insight-card.opportunity { border-left-color: var(--opportunity); }
+.insight-number {
+  flex: 0 0 30px; width: 30px; height: 30px; border-radius: 50%;
+  background: var(--team-primary); color: var(--team-primary-text);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 900; font-size: 12px;
+}
+.insight-title { font-size: 14px; font-weight: 900; margin-bottom: 3px; }
+.insight-body { color: var(--muted); font-size: 13px; line-height: 1.45; }
+
+.two-column {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px; align-items: start;
+}
+.three-column {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 15px; align-items: start;
+}
+
+.scouting-plan-card {
+  border: 1px solid var(--line); border-top: 5px solid var(--team-primary);
+  border-radius: 12px; background: #FFFFFF; padding: 18px 20px; min-height: 100%;
+}
+.scouting-plan-title {
+  color: var(--team-primary); font-size: 17px; font-weight: 900;
+  text-transform: uppercase; letter-spacing: .5px; margin-bottom: 14px;
+}
+.plan-subhead {
+  color: var(--ink); font-size: 11px; font-weight: 900;
+  text-transform: uppercase; letter-spacing: .8px; margin: 16px 0 7px 0;
+}
+.scouting-plan-card ul { margin: 0 0 4px 0; padding-left: 18px; }
+.scouting-plan-card li { color: #4F5C67; line-height: 1.45; margin-bottom: 7px; }
+
+.list-card-sub {
+  color: var(--muted); font-size: 11.5px; line-height: 1.45; margin-bottom: 12px;
+}
+.top-player-list { display: grid; gap: 6px; }
+.top-player-row {
+  border: 1px solid var(--line); border-radius: 8px; background: var(--soft);
+  padding: 8px 10px; color: #45535E; font-size: 12px; font-weight: 600;
+  display: flex; justify-content: space-between; gap: 10px;
+}
+
+.callout {
+  background: var(--soft); border: 1px solid var(--line); border-radius: 9px;
+  padding: 13px 15px; color: #53616D; font-size: 12.5px; line-height: 1.5;
+  margin-bottom: 16px;
+}
+.source-note {
+  color: var(--muted); font-size: 11px; line-height: 1.5;
+  margin: -8px 0 20px 0;
+}
+.muted-inline { color: var(--muted); }
+
+.advance-table {
+  width: 100%; border-collapse: collapse; margin: 8px 0 22px 0; font-size: 12px;
+}
+.advance-table thead th {
+  background: var(--team-primary); color: var(--team-primary-text);
+  border: none !important; padding: 10px 9px !important;
+  font-size: 10px; font-weight: 800; text-transform: uppercase;
+  letter-spacing: .4px; text-align: left;
+}
+.advance-table tbody td {
+  padding: 9px !important; border-bottom: 1px solid var(--line) !important;
+  vertical-align: middle !important;
+}
+.advance-table tbody tr:nth-child(even) { background: #FAFBFC; }
+.table-scroll { overflow-x: auto; }
+
+.percentile-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px; margin-bottom: 22px;
+}
+.percentile-card {
+  border: 1px solid var(--line); border-radius: 11px; background: #FFFFFF; padding: 14px;
+}
+.percentile-top {
+  display: flex; justify-content: space-between; gap: 12px;
+  font-weight: 800; margin-bottom: 9px;
+}
+.percentile-top strong { color: var(--team-primary); }
+.percentile-track, .probability-track {
+  height: 8px; background: #E9EDF1; border-radius: 999px; overflow: hidden;
+}
+.percentile-fill { height: 100%; border-radius: 999px; background: var(--team-secondary); }
+.percentile-foot { color: var(--muted); font-size: 10px; margin-top: 7px; }
+
+.status-heavy { color: #A13C35; font-weight: 900; }
+.status-watch { color: #896718; font-weight: 900; }
+.status-fresh { color: #306B55; font-weight: 900; }
+
+/* ---- Spray distribution bar ---- */
+.spray-bar {
+  display: flex; width: 150px; height: 18px; border-radius: 4px;
+  overflow: hidden; border: 1px solid var(--line);
+}
+.spray-seg {
+  color: #FFFFFF; font-size: 9px; font-weight: 800;
+  display: flex; align-items: center; justify-content: center; min-width: 0;
+}
+.spray-left { background: var(--team-primary); }
+.spray-center { background: #8B9AA6; }
+.spray-right { background: var(--team-secondary); color: var(--team-secondary-text); }
+.spray-key { display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-bottom: 12px; }
+.spray-key span { display: flex; align-items: center; gap: 5px; }
+.spray-dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+.inning-chart {
+  display: grid; grid-template-columns: repeat(9, minmax(42px, 1fr));
+  gap: 10px; align-items: end; min-height: 250px;
+  padding: 20px 14px 10px 14px; margin: 8px 0 6px 0;
+  border: 1px solid var(--line); border-radius: 12px;
+  background: linear-gradient(to top, #FFFFFF, #FAFBFC);
+}
+.inning-column {
+  display: flex; flex-direction: column; justify-content: flex-end;
+  align-items: center; min-width: 0;
+}
+.inning-value { color: var(--team-primary); font-size: 12px; font-weight: 900; margin-bottom: 6px; }
+.inning-bar-wrap {
+  width: 100%; height: 185px; display: flex; align-items: flex-end;
+  justify-content: center; border-bottom: 1px solid var(--line);
+}
+.inning-bar {
+  width: 68%; min-height: 3px; border-radius: 7px 7px 0 0;
+  background: var(--team-primary);
+}
+.inning-label { margin-top: 8px; color: var(--muted); font-size: 11px; font-weight: 700; }
+.inning-caption {
+  color: var(--muted); font-size: 11px; margin-bottom: 20px; text-align: center;
+}
+
+/* ---- Data quality ---- */
+.dq-grid { display: grid; gap: 9px; margin-bottom: 20px; }
+.dq-row {
+  display: grid; grid-template-columns: 92px 1fr; gap: 12px;
+  border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px;
+  background: #FFFFFF; align-items: start;
+}
+.dq-badge {
+  font-size: 10px; font-weight: 900; letter-spacing: .5px;
+  text-align: center; padding: 4px 6px; border-radius: 5px;
+}
+.dq-ok { background: #E4F0EA; color: #24614A; }
+.dq-note { background: #FBF2DC; color: #7A5B12; }
+.dq-bad { background: #F7E3E1; color: #8E332C; }
+.dq-title { font-weight: 800; font-size: 13px; margin-bottom: 2px; }
+.dq-detail { color: var(--muted); font-size: 12px; line-height: 1.45; }
+
+.footer {
+  border-top: 1px solid var(--line); color: var(--muted); text-align: center;
+  font-size: 10px; margin-top: 40px; padding-top: 18px;
+}
+
+@media (max-width: 900px) {
+  .ar-shell { margin: 0; padding: 0 18px 40px 18px; border-radius: 0; }
+  .hero {
+    margin: 0 -18px 20px -18px; padding: 26px 22px;
+    grid-template-columns: 92px minmax(0, 1fr);
+  }
+  .hero-logo-box { width: 88px; height: 88px; border-radius: 15px; }
+  .hero-logo { max-width: 68px; max-height: 68px; }
+  .hero-title { font-size: 26px; }
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .two-column, .three-column, .percentile-grid { grid-template-columns: 1fr; }
+}
+
+@media print {
+  .tabbar { display: none; }
+  /* every tab is expanded, so a printed copy is the whole report */
+  .ar-panel.is-hidden { display: block !important; }
+  .ar-shell { box-shadow: none; margin: 0; max-width: none; padding: 0 12px; }
+  body { background: #FFFFFF; }
+
+  /* keep the team colours in the PDF rather than printing white */
+  html, body {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* one section per page, and never split a card down the middle */
+  .ar-panel { break-before: page; page-break-before: always; }
+  .ar-panel:first-of-type { break-before: auto; page-break-before: auto; }
+  .hero { break-after: avoid; page-break-after: avoid; }
+  .metric-card, .insight-card, .scouting-plan-card, .percentile-card,
+  .threat-card, .dq-row, .inning-chart {
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  .advance-table tr { break-inside: avoid; page-break-inside: avoid; }
+  .advance-table thead { display: table-header-group; }
+  .table-scroll { overflow: visible; }
+  h2, h3 { break-after: avoid; page-break-after: avoid; }
+}
+</style>
+'))
+```
+
+```{r shell_and_hero, results='asis'}
+# ============================================================
+# 27. PAGE SHELL, HERO, TAB BAR
+# ============================================================
+
+AR_TABS <- c(
+  overview = "Overview",
+  hitters  = "Hitters",
+  pitching = "Pitching",
+  spray    = "Spray & Splits",
+  deep     = "Deep Dive",
+  plan     = "Game Plan",
+  quality  = "Data Quality"
+)
+
+panel_open  <- function(id) cat(paste0('<div class="ar-panel" id="panel-', id, '">'))
+panel_close <- function() cat('</div>')
+
+cat('<div class="ar-shell">')
+
+cat(paste0(
+  '<section class="hero">',
+    '<div class="hero-logo-box">', logo_html, '</div>',
+    '<div>',
+      '<div class="hero-kicker">Opponent Advance Report</div>',
+      '<div class="hero-title">', html_escape(TEAM_NAME), '</div>',
+      '<div class="hero-subtitle">',
+        SEASON, ' · ', TEAM_RECORD,
+        if (CONF_RECORD == "—") "" else
+          paste0(' · ', html_escape(CONF_LABEL), ' ', CONF_RECORD),
+        ' · vs D-I ', D1_RECORD,
+      '</div>',
+      '<div class="hero-meta">',
+        'Season data through ', format(AS_OF_DATE, "%B %d, %Y"), ' · ',
+        'Detail window ', BOX_GAMES, ' of ', REQUESTED_GAMES, ' games',
+        ' · Built ', format(Sys.time(), "%b %d, %Y %H:%M"),
+      '</div>',
+    '</div>',
+  '</section>'
+))
+
+cat('<div class="tabbar">')
+for (i in seq_along(AR_TABS)) {
+  cat(paste0(
+    '<button class="tabbtn', if (i == 1) ' is-active' else '',
+    '" data-panel="panel-', names(AR_TABS)[i], '">',
+    html_escape(AR_TABS[[i]]), '</button>'
+  ))
+}
+cat('</div>')
+```
+
+```{r tab_script, results='asis'}
+# Tabs are plain DOM. Panels start visible so that a browser
+# with JavaScript disabled - and the print stylesheet - still
+# show the whole report rather than one section.
+cat('
+<script>
+(function () {
+  function activate(id) {
+    document.querySelectorAll(".ar-panel").forEach(function (p) {
+      p.classList.toggle("is-hidden", p.id !== id);
+    });
+    document.querySelectorAll(".tabbtn").forEach(function (b) {
+      b.classList.toggle("is-active", b.dataset.panel === id);
+    });
+  }
+  function init() {
+    var buttons = Array.prototype.slice.call(document.querySelectorAll(".tabbtn"));
+    if (!buttons.length) return;
+    buttons.forEach(function (b) {
+      b.addEventListener("click", function () { activate(b.dataset.panel); });
+    });
+    activate(buttons[0].dataset.panel);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
+')
+```
+
+```{r panel_overview_open, results='asis'}
+panel_open("overview")
+```
+
+```{r overview_metrics, results='asis'}
+overview_cards <- c(
+  metric_card(
+    "Record", TEAM_RECORD,
+    paste0(CONF_LABEL, " ", CONF_RECORD, " · vs D-I ", D1_RECORD),
+    source = "ESPN schedule"
+  ),
+  metric_card(
+    "Runs / Game", fmt(season_row$R_G, 2),
+    paste0("Last ", recent_row$G, ": ", fmt(recent_row$R_G, 2)),
+    source = "Season"
+  ),
+  metric_card(
+    "Runs Allowed / Game", fmt(season_row$RA_G, 2),
+    paste0("Last ", recent_row$G, ": ", fmt(recent_row$RA_G, 2)),
+    source = "Season"
+  ),
+  metric_card(
+    "Run Diff / Game", fmt_signed(season_row$RD_G, 2),
+    paste0("One-run games ", ONE_RUN_RECORD),
+    source = "Season"
+  ),
+  metric_card(
+    "Recent Record", paste0(recent_row$W, "-", recent_row$L),
+    paste0("Last ", recent_row$G, " completed games"),
+    source = "Season"
+  )
+)
+cat('<div class="metric-grid">', paste(overview_cards, collapse = ""), '</div>')
+
+if (NON_D1_N > 0) {
+  cat(callout(
+    "<strong>Schedule note.</strong> ", NON_D1_N, " of ", nrow(completed),
+    " completed games came against opponents that do not appear in the ESPN ",
+    "Division I index. Those games are included in the season rates above; the ",
+    "vs D-I record is shown alongside so the two are never confused."
+  ))
+}
+```
+
+<div class="section-kicker">Opponent Identity</div>
+<div class="section-title">Five things to know</div>
+
+```{r five_things, results='asis'}
+five <- dplyr::slice_head(flags, n = 5)
+
+if (nrow(five) < 5) {
+  need <- 5 - nrow(five)
+  filler <- tibble::tibble(
+    Title = c("RECENT FORM", "ROTATION", "BULLPEN", "RUNNING GAME", "SCORING SHAPE"),
+    Body = c(
+      paste0("They are ", recent_row$W, "-", recent_row$L,
+             " over the last ", recent_row$G, " completed games."),
+      "See the Pitching tab for the projected starter and the series-slot evidence behind it.",
+      "See the Pitching tab for which relief arms are carrying recent workload.",
+      "See the Spray & Splits tab for who actually runs and how often it works.",
+      "See the Deep Dive tab for when in the game their runs have come."
+    ),
+    Type = rep("info", 5)
+  ) |>
+    dplyr::slice_head(n = need)
+  five <- dplyr::bind_rows(five, filler)
+}
+
+five_html <- vapply(seq_len(nrow(five)), function(i) {
+  insight_card(five$Title[i], five$Body[i], five$Type[i], number = i)
+}, character(1))
+
+cat('<div class="insight-stack">', paste(five_html, collapse = ""), '</div>')
+```
+
+<div class="two-column">
+<div>
+<div class="section-kicker">Rotation</div>
+<div class="section-title">Projected starter</div>
+
+```{r overview_starters, results='asis'}
+if (nrow(rotation_projection) == 0) {
+  cat(callout("No starting-pitcher rows were available in the detail window."))
+} else {
+  tbl <- rotation_projection |>
+    dplyr::slice_head(n = 3) |>
+    dplyr::transmute(
+      Player,
+      `Last start` = format(LastStart, "%b %d"),
+      `Slot history` = SlotMix,
+      Projection = projection_html(Projection)
+    )
+  cat(ar_table(tbl, escape = FALSE))
+  cat(source_note(
+    "Ranked by recency-weighted starts in the same series slot as the next ",
+    "scheduled game, then adjusted for whether there is enough rest to start it. ",
+    "Tiers, not probabilities - this data does not support a percentage."
+  ))
+}
+```
+
+</div>
+<div>
+<div class="section-kicker">Recent Form</div>
+<div class="section-title">Season vs now</div>
+
+```{r recent_form, results='asis'}
+recent_table <- recent_comparison |>
+  dplyr::transmute(
+    Window,
+    Record = paste0(W, "-", L),
+    `Win %` = fmt_pct(WinPct, 1),
+    `R/G`   = fmt(R_G, 2),
+    `RA/G`  = fmt(RA_G, 2),
+    `RD/G`  = fmt_signed(RD_G, 2)
+  )
+cat(ar_table(recent_table))
+```
+
+</div>
+</div>
+
+<div class="section-title">Series plan</div>
+
+```{r quick_plan, results='asis'}
+cat(
+  '<div class="two-column">',
+  scouting_plan_card(
+    title = "Pitcher Plan",
+    strength_title = "Where their offense is strong",
+    strengths = game_plan$pitcher_plan$strengths,
+    response_title = "How we mitigate it",
+    response_items = game_plan$pitcher_plan$counter,
+    top_title = game_plan$pitcher_plan$top_title,
+    top_players = game_plan$pitcher_plan$top_players
+  ),
+  scouting_plan_card(
+    title = "Hitter Plan",
+    strength_title = "What their pitching does well",
+    strengths = game_plan$hitter_plan$strengths,
+    weakness_title = "Where we can attack",
+    weaknesses = game_plan$hitter_plan$weaknesses,
+    response_title = "How we take advantage",
+    response_items = game_plan$hitter_plan$attack,
+    top_title = game_plan$hitter_plan$top_title,
+    top_players = game_plan$hitter_plan$top_players
+  ),
+  '</div>'
+)
+```
+
+### Recent results
+
+```{r recent_results_table, results='asis'}
+cat(ar_table(recent_results))
+```
+
+```{r panel_overview_close, results='asis'}
+panel_close()
+```
+
+```{r panel_hitters_open, results='asis'}
+panel_open("hitters")
+```
+
+<div class="section-kicker">Lineup Preparation</div>
+<div class="section-title">Expected lineup and hitter profile</div>
+
+```{r lineup_callout, results='asis'}
+cat(callout(
+  "<strong>Read this first.</strong> Two different windows appear on this page ",
+  "and they are never mixed in the same column. The <em>season line</em> is the ",
+  "official full-season total. The <em>recent window</em> is built from the ",
+  BOX_GAMES, " most recent games that returned a box score. ",
+  if (NCAA_OK) {
+    "Season rate stats come from stats.ncaa.org and are recomputed from the counting stats."
+  } else {
+    paste0(
+      "The official NCAA source was unavailable for this render, so the season ",
+      "line falls back to the most recent ESPN season-to-date snapshot. Treat it ",
+      "as approximate."
+    )
+  }
+))
+```
+
+### Expected lineup
+
+```{r expected_lineup_table, results='asis'}
+if (nrow(expected_lineup) == 0) {
+  cat(callout("No starting-lineup rows were available in the detail window."))
+} else {
+  cat(ar_table(
+    expected_lineup |>
+      dplyr::transmute(
+        Spot, Player, Pos,
+        `Starts (last 5)` = Starts,
+        `Last start` = format(LastStart, "%b %d"),
+        `Next most used` = Alternate
+      )
+  ))
+  cat(source_note(
+    "Built from the most recent five games with a published starting lineup. ",
+    "The last column shows the next most frequent name in that spot, so an ",
+    "unsettled lineup reads as unsettled instead of certain."
+  ))
+}
+```
+
+### Season line
+
+```{r hitter_season_table, results='asis'}
+qualified_hitters <- dplyr::filter(hitters, Qualified %in% TRUE)
+
+if (nrow(qualified_hitters) == 0) {
+  cat(callout("No hitters cleared the qualifying sample for a season line."))
+} else {
+  tbl <- qualified_hitters |>
+    dplyr::arrange(dplyr::desc(dplyr::coalesce(s_OPS, Reach))) |>
+    dplyr::transmute(
+      Player,
+      Pos = fmt_chr(dplyr::coalesce(s_Pos, Pos)),
+      Yr  = fmt_chr(s_Yr),
+      G   = fmt_int(s_G), PA = fmt_int(s_PA),
+      AVG = fmt_avg(s_AVG), OBP = fmt_avg(s_OBP), SLG = fmt_avg(s_SLG),
+      OPS = fmt_avg(s_OPS), ISO = fmt_avg(s_ISO),
+      HR  = fmt_int(s_HR), `BB%` = fmt_pct(s_BBpct), `K%` = fmt_pct(s_Kpct),
+      SB  = fmt_int(s_SB)
+    ) |>
+    drop_empty_cols(keep = c("Player", "AVG", "OBP", "SLG", "OPS"))
+  cat('<div class="table-scroll">')
+  cat(ar_table(tbl))
+  cat('</div>')
+  cat(source_note(
+    if (NCAA_OK) {
+      paste0(
+        "Source: stats.ncaa.org season totals, ", SEASON,
+        ". Slash line recomputed from AB / H / TB / BB / HBP / SF rather than ",
+        "read off the published rate columns. Qualifier: 40 or more plate appearances."
+      )
+    } else {
+      paste0(
+        "Source: the most recent ESPN season-to-date snapshot, which carries ",
+        "only the slash line - games, plate appearances, home runs and stolen ",
+        "bases are not in it, so those columns are dropped rather than shown ",
+        "empty. Qualifier: ", MIN_AB_WINDOW,
+        " or more at-bats in the recent window."
+      )
+    }
+  ))
+}
+```
+
+### Recent window
+
+```{r hitter_window_table, results='asis'}
+if (nrow(batting_window) == 0) {
+  cat(callout("No hitter box-score rows were returned for the detail window."))
+} else {
+  window_tbl <- batting_window |>
+    dplyr::filter(AB >= MIN_AB_WINDOW) |>
+    dplyr::arrange(dplyr::desc(Reach)) |>
+    dplyr::transmute(
+      Player, Pos, G, AB,
+      AVG = fmt_avg(wAVG),
+      `Reach%` = fmt_pct(Reach, 1),
+      HR, BB, K, RBI, R,
+      `Last game` = format(LastGame, "%b %d")
+    )
+  cat(ar_table(window_tbl))
+  cat(source_note(
+    "Source: ESPN game box scores, last ", BOX_GAMES, " games. ",
+    "<strong>Reach%</strong> is (H + BB) / (AB + BB) - it is not on-base ",
+    "percentage. ESPN game box scores do not publish hit-by-pitch or sacrifice ",
+    "flies, so a true OBP cannot be built from this window and is not shown here. ",
+    "Use the season line above for OBP."
+  ))
+
+  short_sample <- dplyr::filter(batting_window, AB < MIN_AB_WINDOW)
+  if (nrow(short_sample) > 0) {
+    cat('<h3>Limited sample</h3>')
+    cat(ar_table(
+      short_sample |>
+        dplyr::arrange(dplyr::desc(AB)) |>
+        dplyr::transmute(
+          Player, Pos, G, AB, H, HR, BB, K,
+          `Last game` = format(LastGame, "%b %d")
+        )
+    ))
+    cat(source_note(
+      "Under ", MIN_AB_WINDOW, " at-bats in the window. Shown as counting stats ",
+      "only - rate stats on samples this size are noise, so they are not computed."
+    ))
+  }
+}
+```
+
+```{r panel_hitters_close, results='asis'}
+panel_close()
+```
+
+```{r panel_pitching_open, results='asis'}
+panel_open("pitching")
+```
+
+<div class="section-kicker">Staff Preparation</div>
+<div class="section-title">Rotation, workload and staff profile</div>
+
+### Rotation projection
+
+```{r rotation_table, results='asis'}
+if (nrow(rotation_projection) == 0) {
+  cat(callout("No starting-pitcher rows were available in the detail window."))
+} else {
+  next_desc <- if (!is.na(NEXT_GAME$opponent_label[[1]])) {
+    paste0(
+      format(NEXT_GAME$game_date[[1]], "%b %d"), " vs ",
+      NEXT_GAME$opponent_label[[1]],
+      if (!is.na(NEXT_GAME$series_slot[[1]]))
+        paste0(" (game ", NEXT_GAME$series_slot[[1]], " of the series)") else ""
+    )
+  } else {
+    "the next scheduled game"
+  }
+
+  cat(ar_table(
+    rotation_projection |>
+      dplyr::transmute(
+        Player, Starts,
+        `Slot history` = SlotMix,
+        `Starts in this slot` = SlotStarts,
+        `Last start` = format(LastStart, "%b %d"),
+        `Typical rest` = ifelse(is.na(TypicalRest), "—",
+                                paste0(round(TypicalRest), " d")),
+        `Days out` = ifelse(is.na(DaysToGame), "—", round(DaysToGame)),
+        Projection = projection_html(Projection)
+      ),
+    escape = FALSE
+  ))
+  cat(source_note(
+    "Projecting for ", html_escape(next_desc), ". ",
+    "College staffs line up by series slot, not by rest days, so slot history ",
+    "carries the most weight, discounted by recency, then penalised if there is ",
+    "not enough rest. Every input is printed above so the call can be overridden."
+  ))
+}
+```
+
+### Starter workload
+
+```{r workload_table, results='asis'}
+if (nrow(workload) == 0) {
+  cat(callout("No starts were recorded in the detail window."))
+} else {
+  cat(ar_table(
+    workload |>
+      dplyr::transmute(
+        Player, GS,
+        `Typical outing` = TypicalIP,
+        `Longest outing` = LongestIP,
+        `Median pitches` = ifelse(is.na(MedPitches), "—", round(MedPitches)),
+        `Max pitches`    = ifelse(is.na(MaxPitches), "—", round(MaxPitches))
+      )
+  ))
+  cat(source_note(
+    "How deep each starter has actually gone. This is where the opening is: ",
+    "if a starter's typical outing ends around a known pitch count, the third ",
+    "time through the order is when the plan changes. ESPN does not publish a ",
+    "pitch count for every college game, so blanks here are missing data, not zeros."
+  ))
+}
+```
+
+### Pitcher usage — recent window
+
+```{r pitcher_window_table, results='asis'}
+if (nrow(pitching_window) == 0) {
+  cat(callout("No pitcher box-score rows were returned for the detail window."))
+} else {
+  cat(ar_table(
+    pitching_window |>
+      dplyr::filter(Outs > 0) |>
+      dplyr::transmute(
+        Player, App, GS, IP,
+        ERA = fmt(ERA, 2), WHIP = fmt(WHIP, 2), K, BB,
+        `K/9` = fmt(K9, 1), `BB/9` = fmt(BB9, 1),
+        `Last` = format(LastApp, "%b %d")
+      )
+  ))
+  cat(source_note(
+    "Source: ESPN game box scores, last ", BOX_GAMES, " games. ERA, K/9 and BB/9 ",
+    "are computed from innings actually recorded in this window - they are not ",
+    "the season figures. Innings are summed in outs, so a total can never come ",
+    "out as an impossible value like 4.3."
+  ))
+}
+```
+
+### Season line
+
+```{r pitcher_season_table, results='asis'}
+if (nrow(ncaa_pitching) == 0) {
+  cat(callout(
+    "Official NCAA pitching totals were not available for this render, so no ",
+    "season pitching line is shown. The recent-window table above is unaffected."
+  ))
+} else {
+  cat(ar_table(
+    pitchers |>
+      dplyr::filter(!is.na(s_IP), s_IP > 0) |>
+      dplyr::arrange(s_ERA) |>
+      dplyr::transmute(
+        Player, App = fmt_int(s_App), GS = fmt_int(s_GS),
+        IP = fmt(s_IP, 1), ERA = fmt(s_ERA, 2), WHIP = fmt(s_WHIP, 2),
+        `K/9` = fmt(s_K9, 1), `BB/9` = fmt(s_BB9, 1),
+        `H/9` = fmt(s_H9, 1), `K/BB` = fmt(s_KBB, 2)
+      ) |>
+      drop_empty_cols(keep = c("Player", "IP", "ERA", "WHIP"))
+  ))
+  cat(source_note("Source: stats.ncaa.org season totals, ", SEASON, "."))
+}
+```
+
+### Bullpen workload — last 7 days
+
+```{r bullpen_table, results='asis'}
+if (nrow(bullpen_usage) == 0) {
+  cat(callout("No relief appearances were returned for the detail window."))
+} else {
+  cat(ar_table(
+    bullpen_usage |>
+      dplyr::transmute(
+        Player,
+        Last = format(Last, "%b %d"),
+        `Days rest` = DaysRest,
+        `App (7d)` = App7,
+        `IP (7d)` = IP7,
+        `Pitches (7d)` = Pitches7,
+        `Back-to-back` = B2B,
+        Status = status_html(Status)
+      ),
+    escape = FALSE
+  ))
+  cat(source_note(
+    "Workload is measured against the last completed game, ",
+    format(AS_OF_DATE, "%b %d"), ". Back-to-back days now count toward the ",
+    "HEAVY flag, since consecutive-day usage constrains availability more than ",
+    "raw appearance totals do."
+  ))
+}
+```
+
+### Pitcher splits
+
+```{r pitcher_split_table, results='asis'}
+if (nrow(role_splits) == 0) {
+  cat(callout("Not enough appearances to build pitcher splits."))
+} else {
+  keep_ids <- pitching_window |>
+    dplyr::filter(Outs >= MIN_OUT_WINDOW) |>
+    dplyr::pull(athlete_id)
+
+  tbl <- role_splits |>
+    dplyr::filter(athlete_id %in% keep_ids, Outs > 0) |>
+    dplyr::arrange(Player, Split) |>
+    dplyr::transmute(
+      Player, Split, App, IP,
+      ERA = fmt(ERA, 2), WHIP = fmt(WHIP, 2),
+      `K/9` = fmt(K9, 1), `BB/9` = fmt(BB9, 1)
+    )
+  cat('<div class="table-scroll">')
+  cat(ar_table(tbl))
+  cat('</div>')
+  cat(source_note(
+    "Splits are built from box-score appearances rather than from play-by-play. ",
+    "ESPN college play-by-play does not reliably identify which pitcher is on ",
+    "the mound for a given at-bat, so a per-pitcher batter-level split would be ",
+    "guesswork. Anything that needs the man on the mound is reported at staff ",
+    "level on the Spray & Splits tab and labelled that way."
+  ))
+}
+```
+
+```{r panel_pitching_close, results='asis'}
+panel_close()
+```
+
+```{r panel_spray_open, results='asis'}
+panel_open("spray")
+```
+
+<div class="section-kicker">Batted Ball & Situational</div>
+<div class="section-title">Spray tendencies and splits</div>
+
+```{r spray_intro, results='asis'}
+cat(callout(
+  "<strong>What this is.</strong> Every line below is parsed out of the play-by-play ",
+  "text for ", PBP_GAMES, " games. Direction is <em>field</em> direction, not pull ",
+  "or opposite field: ESPN does not publish batting handedness for college ",
+  "players, so pull side is not knowable and is not guessed at. Gap balls are ",
+  "assigned to the half of the field they were hit toward. The share of plays ",
+  "that could not be parsed is reported at the bottom of this tab rather than ",
+  "quietly dropped."
+))
+```
+
+### Hitter spray profile
+
+```{r spray_table, results='asis'}
+if (nrow(spray) == 0) {
+  cat(callout("No batted balls could be parsed from the play-by-play."))
+} else {
+  cat(
+    '<div class="spray-key">',
+      '<span><i class="spray-dot" style="background:var(--team-primary)"></i>Left side</span>',
+      '<span><i class="spray-dot" style="background:#8B9AA6"></i>Middle</span>',
+      '<span><i class="spray-dot" style="background:var(--team-secondary)"></i>Right side</span>',
+    '</div>'
+  )
+  tbl <- spray |>
+    dplyr::filter(BIP >= 8) |>
+    dplyr::transmute(
+      Player, BIP,
+      Direction = spray_bar(LeftPct, CenterPct, RightPct),
+      Lean,
+      `GB%` = fmt_pct(GBPct),
+      `Air%` = fmt_pct(AirPct),
+      `Parsed` = fmt_pct(DirCover)
+    )
+  cat('<div class="table-scroll">')
+  cat(ar_table(tbl, escape = FALSE))
+  cat('</div>')
+  cat(source_note(
+    "BIP = balls in play in the window. <strong>Parsed</strong> is the share of ",
+    "that hitter's balls in play where the play text named a direction; a low ",
+    "number there means the bar above it is built on less than it looks. ",
+    "Minimum eight balls in play to appear."
+  ))
+
+  thin <- dplyr::filter(spray, BIP < 8)
+  if (nrow(thin) > 0) {
+    cat(source_note(
+      nrow(thin), " additional hitters had fewer than eight parsed balls in play ",
+      "and are held out rather than shown with a direction split that cannot mean anything."
+    ))
+  }
+}
+```
+
+### Hitter situational splits
+
+```{r hitter_splits_table, results='asis'}
+if (nrow(hitter_splits) == 0) {
+  cat(callout("No plate appearances could be attributed from the play-by-play."))
+} else {
+  tbl <- hitter_splits |>
+    dplyr::filter(Enough) |>
+    dplyr::arrange(dplyr::desc(PA)) |>
+    dplyr::transmute(
+      Player, PA,
+      `On-base%` = fmt_pct(OB, 1),
+      `K%` = fmt_pct(Kpct),
+      `RISP PA` = RISP_PA,
+      `RISP AVG` = fmt_avg(RISP_avg),
+      `Leadoff OB%` = fmt_pct(Lead_OB),
+      `1st PA OB%` = fmt_pct(First_OB),
+      `3rd+ PA OB%` = fmt_pct(Later_OB)
+    )
+  cat('<div class="table-scroll">')
+  cat(ar_table(tbl))
+  cat('</div>')
+  cat(source_note(
+    "Derived from play text, so these are parsed plate appearances rather than ",
+    "official ones and will not tie exactly to the season line. Runners in ",
+    "scoring position is reconstructed conservatively - it only counts a runner ",
+    "the text positively places on second or third, and clears on runs scored ",
+    "and outs on the bases, so it undercounts before it overcounts. ",
+    "Minimum 20 parsed plate appearances."
+  ))
+}
+```
+
+### Team situational — offense
+
+```{r team_situational_off, results='asis'}
+if (nrow(situational_off) == 0) {
+  cat(callout("No offensive plate appearances could be parsed."))
+} else {
+  cat(ar_table(
+    situational_off |>
+      dplyr::transmute(
+        Split, PA, H, BB, K,
+        `On-base%` = fmt_pct(OB, 1),
+        `K%` = fmt_pct(Kpct, 1)
+      )
+  ))
+}
+```
+
+### Team situational — pitching staff
+
+```{r team_situational_def, results='asis'}
+if (nrow(situational_def) == 0) {
+  cat(callout("No opposing plate appearances could be parsed."))
+} else {
+  cat(ar_table(
+    situational_def |>
+      dplyr::transmute(
+        Split,
+        `PA faced` = PA,
+        `H allowed` = H,
+        `BB issued` = BB,
+        `K` = K,
+        `On-base% allowed` = fmt_pct(OB, 1),
+        `K%` = fmt_pct(Kpct, 1)
+      )
+  ))
+  cat(source_note(
+    "Staff level, not per pitcher - see the note on the Pitching tab. ",
+    "This is how the whole staff has handled each situation across ",
+    PBP_GAMES, " games."
+  ))
+}
+```
+
+### Running game
+
+```{r running_game_tables, results='asis'}
+if (nrow(running_game$totals) == 0) {
+  cat(callout("No baserunning events could be parsed."))
+} else {
+  cat('<div class="two-column"><div>')
+  cat(ar_table(running_game$totals))
+  cat('</div><div>')
+  if (nrow(running_game$players) == 0) {
+    cat(callout("No individual runner could be attributed."))
+  } else {
+    cat(ar_table(
+      running_game$players |>
+        dplyr::transmute(
+          Player, SB, CS, `Att` = Att,
+          `Success` = fmt_pct(Success), `Bunts` = Bunt
+        )
+    ))
+  }
+  cat('</div></div>')
+  cat(source_note(
+    "Attribution is to the player named at the start of the play only. ",
+    "The previous build credited every roster name that appeared anywhere in ",
+    "the sentence, which handed steal attempts to the catcher and shortstop on ",
+    "any caught-stealing play."
+  ))
+}
+```
+
+### Parse coverage
+
+```{r parse_coverage_table, results='asis'}
+cat(ar_table(coverage_pbp))
+cat(source_note(
+  "These figures govern how much weight to put on this tab. A direction or type ",
+  "share well under 100% means the play text was less descriptive in those games, ",
+  "not that the hitter did something unusual."
+))
+```
+
+```{r panel_spray_close, results='asis'}
+panel_close()
+```
+
+```{r panel_deep_open, results='asis'}
+panel_open("deep")
+```
+
+<div class="section-kicker">Context</div>
+<div class="section-title">National profile and scoring shape</div>
+
+### Division I relative profile
+
+```{r percentile_section, results='asis'}
+if (nrow(percentiles) == 0) {
+  cat(callout(
+    "This team could not be matched in the ESPN Division I standings feed, so no ",
+    "national percentiles are shown. Every other section of the report is unaffected."
+  ))
+} else {
+  cards <- vapply(seq_len(nrow(percentiles)), function(i) {
+    percentile_card(
+      percentiles$Metric[i], percentiles$Display[i],
+      percentiles$Percentile[i], percentiles$Rank[i], percentiles$Pool[i]
+    )
+  }, character(1))
+  cat('<div class="percentile-grid">', paste(cards, collapse = ""), '</div>')
+  cat(source_note(
+    "Ranks are against the ", percentiles$Pool[[1]], " teams in the ESPN ",
+    "Division I standings feed and are <strong>not adjusted for strength of ",
+    "schedule</strong>. A team that has played a soft schedule will grade high here. ",
+    "Use the rank as context, not as an evaluation."
+  ))
+}
+```
+
+### Recent form
+
+```{r deep_recent, results='asis'}
+cat(ar_table(recent_table))
+```
+
+### Scoring by inning
+
+```{r scoring_plot, results='asis'}
+scoring_by_inning <- if (nrow(run_ledger) == 0) tibble::tibble() else {
+  run_ledger |>
+    dplyr::filter(!is.na(Inning), Inning >= 1) |>
+    dplyr::group_by(Inning) |>
+    dplyr::summarise(Runs = sum(FocalRuns, na.rm = TRUE), .groups = "drop") |>
+    dplyr::arrange(Inning)
+}
+
+if (nrow(scoring_by_inning) == 0) {
+  cat(callout("Scoring-by-inning could not be built from the play-by-play."))
+} else {
+  plot_data <- tibble::tibble(Inning = 1:9) |>
+    dplyr::left_join(
+      dplyr::filter(scoring_by_inning, Inning <= 9), by = "Inning"
+    ) |>
+    dplyr::mutate(Runs = tidyr::replace_na(Runs, 0))
+
+  max_runs <- max(plot_data$Runs, na.rm = TRUE)
+  if (!is.finite(max_runs) || max_runs <= 0) max_runs <- 1
+  plot_data <- dplyr::mutate(plot_data, Height = pmax(2, 100 * Runs / max_runs))
+
+  bars <- vapply(seq_len(nrow(plot_data)), function(i) {
+    paste0(
+      '<div class="inning-column">',
+        '<div class="inning-value">', plot_data$Runs[i], '</div>',
+        '<div class="inning-bar-wrap">',
+          '<div class="inning-bar" style="height:', plot_data$Height[i], '%;"></div>',
+        '</div>',
+        '<div class="inning-label">', plot_data$Inning[i], '</div>',
+      '</div>'
+    )
+  }, character(1))
+
+  cat('<div class="inning-chart">', paste(bars, collapse = ""), '</div>')
+  cat('<div class="inning-caption">Runs scored by inning across ',
+      PBP_GAMES, ' games with play-by-play</div>')
+
+  early  <- sum(scoring_by_inning$Runs[scoring_by_inning$Inning <= 3])
+  middle <- sum(scoring_by_inning$Runs[scoring_by_inning$Inning >= 4 &
+                                         scoring_by_inning$Inning <= 6])
+  late   <- sum(scoring_by_inning$Runs[scoring_by_inning$Inning >= 7])
+  total  <- early + middle + late
+
+  if (total > 0) {
+    cat('<div class="metric-grid">', paste(c(
+      metric_card("Early runs", early,
+                  paste0(round(100 * early / total), "% of parsed runs"), "Innings 1-3"),
+      metric_card("Middle runs", middle,
+                  paste0(round(100 * middle / total), "% of parsed runs"), "Innings 4-6"),
+      metric_card("Late runs", late,
+                  paste0(round(100 * late / total), "% of parsed runs"), "Innings 7+"),
+      metric_card("One-run games", ONE_RUN_RECORD, "Full season", "ESPN schedule"),
+      metric_card(paste0(CONF_LABEL, " record"), CONF_RECORD, "Full season",
+                  "ESPN schedule")
+    ), collapse = ""), '</div>')
+  }
+}
+```
+
+### Automated flags
+
+```{r all_flags, results='asis'}
+flag_html <- vapply(seq_len(nrow(flags)), function(i) {
+  insight_card(flags$Title[i], flags$Body[i], flags$Type[i])
+}, character(1))
+cat('<div class="insight-stack">', paste(flag_html, collapse = ""), '</div>')
+cat(source_note(
+  "Percentile-based flags are measured against the national field. ",
+  "Rate-based flags (power, free bases, running game, bunts, strikeouts) fire on ",
+  "fixed scouting thresholds set in the THRESHOLDS block at the top of the source ",
+  "file - they are conventions, not league percentiles, and are labelled that way ",
+  "on purpose."
+))
+```
+
+```{r panel_deep_close, results='asis'}
+panel_close()
+```
+
+```{r panel_plan_open, results='asis'}
+panel_open("plan")
+```
+
+<div class="section-kicker">Series Preparation</div>
+<div class="section-title">Game plan</div>
+
+```{r game_plan_section, results='asis'}
+cat(
+  '<div class="two-column">',
+  scouting_plan_card(
+    title = "Pitcher Plan",
+    strength_title = "Where their offense is strong",
+    strengths = game_plan$pitcher_plan$strengths,
+    response_title = "How we mitigate it",
+    response_items = game_plan$pitcher_plan$counter,
+    top_title = game_plan$pitcher_plan$top_title,
+    top_players = game_plan$pitcher_plan$top_players
+  ),
+  scouting_plan_card(
+    title = "Hitter Plan",
+    strength_title = "What their pitching does well",
+    strengths = game_plan$hitter_plan$strengths,
+    weakness_title = "Where we can attack",
+    weaknesses = game_plan$hitter_plan$weaknesses,
+    response_title = "How we take advantage",
+    response_items = game_plan$hitter_plan$attack,
+    top_title = game_plan$hitter_plan$top_title,
+    top_players = game_plan$hitter_plan$top_players
+  ),
+  '</div>'
+)
+cat('<div class="section-title">Recent performers</div>')
+cat(
+  '<div class="two-column">',
+  list_card(
+    "Hot Bats", RECENT_SUBTITLE, RECENT_HITTER_LINES
+  ),
+  list_card(
+    "Hot Arms", RECENT_SUBTITLE, RECENT_PITCHER_LINES
+  ),
+  '</div>'
+)
+
+cat(source_note(RANK_METHOD_NOTE))
+cat(source_note(
+  "Plan language is generated from the tables in this report. Where the data did ",
+  "not support a point, the plan says so rather than filling the space. Every ",
+  "claim above traces to a number on another tab."
+))
+```
+
+```{r panel_plan_close, results='asis'}
+panel_close()
+```
+
+```{r panel_quality_open, results='asis'}
+panel_open("quality")
+```
+
+<div class="section-kicker">Trust</div>
+<div class="section-title">Where every number came from</div>
+
+```{r dq_checks, results='asis'}
+checks <- check_log()
+if (nrow(checks) == 0) {
+  cat(callout("No checks were recorded."))
+} else {
+  badge_class <- function(result) {
+    dplyr::case_when(
+      result %in% c("OK") ~ "dq-ok",
+      result %in% c("POOR", "FAILED") ~ "dq-bad",
+      TRUE ~ "dq-note"
+    )
+  }
+  rows <- vapply(seq_len(nrow(checks)), function(i) {
+    paste0(
+      '<div class="dq-row">',
+        '<div class="dq-badge ', badge_class(checks$Result[i]), '">',
+          html_escape(checks$Result[i]), '</div>',
+        '<div>',
+          '<div class="dq-title">', html_escape(checks$Check[i]), '</div>',
+          '<div class="dq-detail">', html_escape(checks$Detail[i]), '</div>',
+        '</div>',
+      '</div>'
+    )
+  }, character(1))
+  cat('<div class="dq-grid">', paste(rows, collapse = ""), '</div>')
+}
+```
+
+### Game-by-game coverage
+
+```{r dq_coverage, results='asis'}
+cat(ar_table(
+  coverage |>
+    dplyr::arrange(dplyr::desc(Date)) |>
+    dplyr::transmute(
+      Date = format(Date, "%b %d"),
+      Opponent,
+      `Box score` = ifelse(Box, "Yes", "MISSING"),
+      `Play-by-play` = ifelse(PBP, "Yes", "MISSING"),
+      `Player rows` = PlayerRows,
+      `Play rows` = PlayRows
+    )
+))
+cat(source_note(
+  "The report asked ESPN for ", REQUESTED_GAMES, " games and received box scores ",
+  "for ", BOX_GAMES, " and play-by-play for ", PBP_GAMES, ". Every window label ",
+  "elsewhere in this report uses the number received, never the number requested. ",
+  "If a game shows MISSING, re-knit with REFRESH_DATA <- TRUE to try it again."
+))
+```
+
+### Source and retrieval log
+
+```{r dq_pulls, results='asis'}
+pulls <- pull_log()
+if (nrow(pulls) == 0) {
+  cat(callout("No pulls were recorded."))
+} else {
+  summary_pulls <- pulls |>
+    dplyr::group_by(Source, Status) |>
+    dplyr::summarise(
+      Items = dplyr::n(),
+      Oldest = min(Retrieved, na.rm = TRUE),
+      Newest = max(Retrieved, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::transmute(
+      Source, Status, Items,
+      `Oldest retrieved` = format(Oldest, "%b %d %H:%M"),
+      `Newest retrieved` = format(Newest, "%b %d %H:%M")
+    )
+  cat(ar_table(summary_pulls))
+
+  failures <- dplyr::filter(pulls, Status == "FAILED")
+  if (nrow(failures) > 0) {
+    cat('<h3>Failed pulls</h3>')
+    cat(ar_table(
+      failures |>
+        dplyr::transmute(Source, Item, When = format(Retrieved, "%b %d %H:%M"), Note)
+    ))
+  }
+  cat(source_note(
+    "Cached rows were read from the cache/ folder and carry the timestamp of ",
+    "when they were originally downloaded, not of this render. That is the point ",
+    "of showing it: a report built entirely from three-week-old cache should look ",
+    "different from a fresh one."
+  ))
+}
+```
+
+### ESPN vs NCAA agreement
+
+```{r dq_reconciliation, results='asis'}
+if (nrow(reconciliation) == 0) {
+  cat(callout(
+    "No cross-source comparison was possible for this render - either the NCAA ",
+    "source was unavailable or no hitters matched by name across the two sources. ",
+    "Season rate stats in this report therefore rest on a single source."
+  ))
+} else {
+  worst <- reconciliation |>
+    dplyr::filter(MaxGap > 0.010) |>
+    dplyr::arrange(dplyr::desc(MaxGap)) |>
+    dplyr::slice_head(n = 12) |>
+    dplyr::transmute(
+      Player,
+      `NCAA AVG` = fmt_avg(n_avg), `ESPN AVG` = fmt_avg(e_avg),
+      `NCAA OBP` = fmt_avg(n_obp), `ESPN OBP` = fmt_avg(e_obp),
+      `NCAA SLG` = fmt_avg(n_slg), `ESPN SLG` = fmt_avg(e_slg),
+      `Largest gap` = fmt_avg(MaxGap)
+    )
+  if (nrow(worst) == 0) {
+    cat(callout(
+      "All ", nrow(reconciliation), " matched hitters agree within 10 points on ",
+      "every rate stat across the two sources."
+    ))
+  } else {
+    cat('<div class="table-scroll">')
+    cat(ar_table(worst))
+    cat('</div>')
+    cat(source_note(
+      "Hitters where the two sources disagree by more than 10 points. Some gap is ",
+      "expected - the ESPN figure is a season-to-date snapshot taken from the last ",
+      "box score in the detail window, so a team that has played since then will ",
+      "differ. A large gap on a player who has not played recently is worth a look. ",
+      "<strong>Where the two disagree, this report uses the NCAA figure.</strong>"
+    ))
+  }
+}
+```
+
+### Play-by-play consistency
+
+```{r dq_pbp_runs, results='asis'}
+if (nrow(pbp_runs_check) == 0) {
+  cat(callout("No play-by-play was available to test against the box scores."))
+} else {
+  mismatch <- dplyr::filter(pbp_runs_check, !Match)
+  cat(callout(
+    "<strong>Scoreboard reconstruction.</strong> Runs rebuilt from the ",
+    "play-by-play scoreboard match the final score in ",
+    sum(pbp_runs_check$Match), " of ", nrow(pbp_runs_check), " games. ",
+    "Runs are taken as the highest score reached in each inning, differenced ",
+    "across innings - not accumulated row by row, which is order-dependent and ",
+    "loses any run whose row is filtered out."
+  ))
+  if (is.finite(TEXT_RUN_RECOVERY)) {
+    cat(callout(
+      "<strong>Text parse.</strong> Separately, the play text names ",
+      fmt_pct(TEXT_RUN_RECOVERY), " of the runs actually scored. That figure ",
+      "touches none of the score columns, so it is an independent check on the ",
+      "parser behind the Spray &amp; Splits tab rather than a restatement of ",
+      "the line above."
+    ))
+  }
+  if (nrow(mismatch) > 0) {
+    cat(ar_table(
+      mismatch |>
+        dplyr::left_join(
+          dplyr::select(completed, game_id = event_id, game_date, opponent_label),
+          by = "game_id"
+        ) |>
+        dplyr::transmute(
+          Date = format(game_date, "%b %d"),
+          Opponent = opponent_label,
+          `Runs in box score` = Box_Runs,
+          `Runs parsed from text` = PBP_Runs
+        )
+    ))
+  }
+}
+```
+
+### Method and limitations
+
+```{r dq_method, results='asis'}
+cat(callout(
+  "<strong>Division of sources.</strong> Season rate stats come from ",
+  "stats.ncaa.org and are recomputed from the counting stats. Recent-window ",
+  "counting stats come from ESPN game box scores. Spray, situational and ",
+  "baserunning tendencies come from ESPN play-by-play text. No column mixes two ",
+  "of these."
+))
+cat(callout(
+  "<strong>What this report cannot do.</strong> ",
+  "There is no batting or throwing handedness in the public college feeds, so ",
+  "there are no platoon splits and no pull/oppo - only field direction. ",
+  "ESPN college play-by-play does not reliably name the pitcher on the mound, so ",
+  "there are no per-pitcher batter-level splits; that material is reported at ",
+  "staff level. ESPN game box scores omit hit-by-pitch, sacrifice flies, doubles ",
+  "and triples, so a window slash line cannot be rebuilt from them and is not ",
+  "shown. National percentiles are unadjusted for strength of schedule. ",
+  "Runners-in-scoring-position state is reconstructed from text and is ",
+  "deliberately conservative."
+))
+cat(callout(
+  "<strong>Reproducing this render.</strong> baseballr ",
+  as.character(utils::packageVersion("baseballr")), " · R ",
+  paste0(R.version$major, ".", R.version$minor), " · ",
+  "team query \"", html_escape(TEAM_QUERY), "\" resolved to ",
+  html_escape(TEAM_NAME), " (ESPN id ", TEAM_ID, ")",
+  if (!is.na(NCAA_TEAM_NAME)) paste0(", NCAA \"", html_escape(NCAA_TEAM_NAME), "\"") else "",
+  " · detail window ", REQUESTED_GAMES, " games requested."
+))
+```
+
+```{r panel_quality_close, results='asis'}
+panel_close()
+```
+
+```{r footer, results='asis'}
+cat(paste0(
+  '<div class="footer">',
+    html_escape(TEAM_NAME), ' · ', SEASON, ' opponent advance · ',
+    'built ', format(Sys.time(), "%B %d, %Y at %H:%M"), ' · ',
+    'sources: ESPN college baseball API',
+    if (NCAA_OK) ' and stats.ncaa.org' else '',
+  '</div>'
+))
+
+cat('</div>')
+```
