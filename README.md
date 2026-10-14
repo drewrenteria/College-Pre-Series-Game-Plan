@@ -6,6 +6,21 @@ self-contained HTML report a coaching staff can use in a pre-series meeting.
 
 **Live example: [UCLA, 2026 season](https://rpubs.com/andrewrenteria/1455679)**
 
+![Game Plan tab](docs/img/game-plan.png)
+
+The Game Plan tab. Everything on it is derived, including the top three
+hitters and pitchers, which are filtered by playing time rather than taken
+off the top of a sorted list.
+
+![Spray and Splits tab](docs/img/spray-splits.png)
+
+Spray tendencies, parsed out of play-by-play text. The parsed share is
+printed per hitter so a thin sample is visible rather than implied.
+
+![Data Quality tab](docs/img/data-quality.png)
+
+The Data Quality tab, which is the one most of the work went into.
+
 ---
 
 ## The question
@@ -83,6 +98,29 @@ team's conference membership from the standings and compares ids. Matching
 "Saint Mary's Gaels" to "Saint Mary's (CA)" across several hundred schools is
 exactly the kind of fuzzy join that produces duplicate players.
 
+**It is deliberately one file.** A staff member should be able to take the
+`.Rmd`, change one line, press Knit, and email the result. Splitting the
+helpers into a package would read as tidier on GitHub and would make the
+thing harder to hand to a coach. The tests below reach into the single file
+rather than the other way around.
+
+## Tests
+
+```r
+Rscript tests/run-all.R
+```
+
+99 assertions, no test framework to install, no network. They cover the
+arithmetic and parsing that the report's conclusions rest on: base-3 innings,
+player identity merging, play attribution, the run ledger, conference
+matching by id, and how missing values render. `tests/README.md` explains
+what each file protects and why.
+
+Most of them exist because the behaviour was wrong at some point during the
+build. The ledger tests pin three properties a naive implementation fails:
+the answer must not change when rows are reordered, must not change when
+duplicate rows are present, and must not lose a run when a row is dropped.
+
 ## Known limitations
 
 Stated here because a scouting product that hides its gaps is worse than one that
@@ -91,8 +129,10 @@ names them.
 - Public college feeds publish no batting or throwing handedness. There are no
   platoon splits, and direction is field direction rather than pull or opposite
   field.
-- ESPN play-by-play does not reliably name the pitcher on the mound, so
-  per-pitcher batter-level splits are reported at staff level.
+- Batter-level splits are reported at staff level rather than per pitcher.
+  The feed does carry the pitcher on each at-bat, in rows of the form
+  "X pitches to Y", so this is a gap in the current build and not in the
+  data. It is the next thing to add.
 - National percentiles are not adjusted for strength of schedule.
 - Runner-in-scoring-position state is reconstructed from play text and is
   deliberately conservative. It undercounts before it overcounts.
@@ -111,8 +151,8 @@ cannot be knit to PDF directly because it writes its own HTML and CSS. For a
 PDF, knit to HTML, open the file in Chrome, and print to PDF with
 "Background graphics" turned on.
 
-Requires R, `rmarkdown`, and `baseballr` 2.0.0 or newer. Remaining packages are
-installed on first run.
+Requires R 4.2 or newer, `rmarkdown`, and `baseballr` 2.0.0 or newer. The
+test suite is run on R 4.3.3. Remaining packages are installed on first run.
 
 Data pulls are cached in `cache/`, so re-knitting the same opponent is fast.
 That folder is gitignored: it is large, it regenerates on demand, and it is not
@@ -122,7 +162,10 @@ mine to redistribute.
 
 ```
 opponent_advance_report.Rmd   the whole build, one file
+tests/                        99 assertions, run with Rscript tests/run-all.R
+docs/img/                     screenshots used above
 README.md                     this file
+LICENSE                       MIT
 .gitignore                    keeps cached data and knitted output out of git
 ```
 
