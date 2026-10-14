@@ -1,40 +1,48 @@
 # Tests
 
 ```
-Rscript tests/run-all.R
+Rscript tests/run-all.R        # from the repo root
 ```
 
-Run it from the repo root. It needs R, `dplyr`, `stringr`, `tidyr`, `tibble`
-and `janitor`, all of which the report itself already uses. There is no test
-framework to install.
+97 assertions. They need R and `dplyr`, `stringr`, `tidyr`, `tibble` and
+`janitor`, all of which the report already requires. Nothing here touches the
+network, the cache, or `baseballr`.
 
-The report is one `.Rmd` by design, so there is no package to load. Instead
-`extract.R` reads the source, slices out individual function definitions by
-name, and evaluates only those. Nothing in the suite touches the network, the
-cache, or the ESPN and NCAA feeds, so it runs offline in about a second.
+## How they reach the code
 
-## What is covered, and why those things
+The report is one `.Rmd` on purpose, so there is no package to load. Each test
+file calls `load_report_functions()`, which reads
+`opponent_advance_report.Rmd`, slices out the named function definitions and
+evaluates only those. The report itself never runs, so a test run cannot pull
+data or write to `cache/`.
 
-| File | What it protects |
+The trade-off is that the extractor matches on `name <- function` at the start
+of a line and takes everything up to the next `}` in column one. That is how
+the file is written, and a test fails loudly if a name stops resolving.
+
+## What each file covers
+
+| File | What it holds down |
 | --- | --- |
-| `test-innings.R` | Innings are base-3. 4.2 is four innings and two outs, so every innings figure is carried as outs. Getting this wrong inflates ERA by about 1%. |
-| `test-identity.R` | ESPN sends the same player under several spellings and sometimes several athlete ids. Left alone they become two players, each holding half a season. |
-| `test-names.R` | Play attribution comes from the leading name in the play text. An earlier version searched the whole sentence and credited fielders with stolen base attempts. |
-| `test-ledger.R` | Scoring by inning is reconstructed from the running scoreboard, not summed from a per-play field. The feed is pitch-level, so summing double counts. |
-| `test-conference.R` | Conference games are matched on team id. Matching school names across several hundred programmes is what produces phantom records. |
-| `test-display.R` | A report running on partial data should look degraded, not broken. Empty columns are dropped and missing values render as a dash. |
+| `test-innings.R` | Innings are base-3. 4.2 plus 0.1 is 5.0, and an ERA denominator uses 4.667, not 4.2. |
+| `test-identity.R` | One player is one row. Middle initials merge, `A. J. Vukovich` survives, the same name on two teams stays two players. |
+| `test-names.R` | Play text is matched on the name that starts the sentence, so the fielders in "c Hawk to ss Cholowsky" are not credited. An ambiguous surname is refused rather than guessed. |
+| `test-ledger.R` | Runs per inning survive duplicated rows, shuffled rows and missing pitch rows. |
+| `test-conference.R` | Conference games are matched by team id, never by school name. |
+| `test-display.R` | A missing number prints as a dash, and a column that is entirely empty is dropped rather than printed as a wall of NA. |
 
-Most of these exist because the behaviour they describe was wrong at some
-point during the build. The ledger tests in particular pin down three
-properties that a naive implementation fails: the answer must not change when
-rows are reordered, must not change when duplicate rows are present, and must
-not lose a run when a row is dropped.
+## Two notes worth reading
 
-## A note on locale
+**Accent folding is locale-dependent.** The report folds accents with
+`iconv(..., "ASCII//TRANSLIT")`. In a UTF-8 locale "José" becomes "Jose"; in a
+bare `C` locale the accented characters are dropped instead, so an accented
+spelling would not join to an unaccented one and the player would appear
+twice. RStudio runs in a UTF-8 locale, so this bites headless runs rather than
+normal use. `run-all.R` sets a UTF-8 locale explicitly and the test skips
+itself, loudly, if none is available.
 
-The report folds accented names with `iconv(..., "ASCII//TRANSLIT")`, whose
-behaviour depends on the session's character locale. Under `LC_CTYPE=C`,
-"José" loses its accented characters rather than becoming "Jose", which would
-stop an accented spelling joining to an unaccented one. RStudio runs in a
-UTF-8 locale so this does not bite in normal use, but `run-all.R` sets one
-explicitly so a headless run tests defined behaviour.
+**The run ledger has one real limit.** It reads the highest score reached in
+each inning, so it survives duplicated and missing rows, but not the loss of
+the single row holding an inning's top score. `test-ledger.R` asserts that
+failure rather than hiding it, which is why the Data Quality tab reconciles
+the rebuilt total against the final score instead of trusting it.

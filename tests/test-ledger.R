@@ -1,95 +1,105 @@
-# Scoring by inning is reconstructed from the running scoreboard rather than
-# summed out of a per-play "scoreValue" field. The feed is pitch-level: the
-# same score appears on many rows, and the result row repeats it again, so
-# summing double-counts. Taking the highest score reached in each inning and
-# differencing makes the answer immune to row order and to dropped rows.
+# Scoring by inning is rebuilt from the running scoreboard on each play row.
+# Two earlier versions got this wrong: summing a scoreValue column double
+# counted (the value appears on the pitch rows AND on the result row), and
+# differencing the score after dropping pitch rows lost any run whose row had
+# been dropped. The current version takes the highest score REACHED in each
+# inning and differences those, which is immune to row order and to most
+# row filtering.
 
 fns <- load_report_functions(c("as_num", "pick_col", "col_or_na",
                                "build_run_ledger"))
+build_run_ledger <- fns$build_run_ledger
 
+# UCLA at home. The away team scores 2 in the 1st; UCLA scores 1 in the 2nd
+# and 2 in the 3rd. Several rows per inning, because the feed is pitch-level.
+plays <- data.frame(
+  game_id       = rep("G1", 9),
+  period_number = c(1, 1, 1, 2, 2, 2, 3, 3, 3),
+  away_score    = c(0, 1, 2, 2, 2, 2, 2, 2, 2),
+  home_score    = c(0, 0, 0, 0, 1, 1, 1, 2, 3),
+  stringsAsFactors = FALSE
+)
 sched <- data.frame(event_id = "G1", home_away = "home",
                     stringsAsFactors = FALSE)
 
-# Home (the focal team) scores 2 in the first, away scores 1 in the second,
-# nobody scores in the third. Several rows per inning, as the feed sends it.
-plays <- data.frame(
-  game_id       = rep("G1", 9),
-  period_number = c(1, 1, 1, 1, 2, 2, 2, 3, 3),
-  away_score    = c(0, 0, 0, 0, 0, 1, 1, 1, 1),
-  home_score    = c(0, 0, 2, 2, 2, 2, 2, 2, 2),
-  stringsAsFactors = FALSE
-)
+led <- build_run_ledger(plays, "66", sched)
 
-led <- fns$build_run_ledger(plays, "100", sched)
+expect("one row per inning", nrow(led), 3L)
+expect("innings come back in order", led$Inning, c(1, 2, 3))
+expect("the home team's runs land on FocalRuns", led$FocalRuns, c(0, 1, 2))
+expect("the away team's runs land on OppRuns",   led$OppRuns,   c(2, 0, 0))
+expect("the ledger totals the real final score",
+       c(sum(led$FocalRuns), sum(led$OppRuns)), c(3, 2))
 
-expect("one row per inning, not per play", nrow(led), 3L)
+# -- the properties the earlier versions failed -------------------------
 
-expect("the focal team's runs land in the right inning",
-       led$FocalRuns, c(2, 0, 0))
+dup <- rbind(plays, plays)
+expect("duplicated rows do not double count",
+       build_run_ledger(dup, "66", sched)$FocalRuns, c(0, 1, 2))
 
-expect("the opponent's runs land in the right inning",
-       led$OppRuns, c(0, 1, 0))
-
-expect("repeated rows do not double count the focal team",
-       sum(led$FocalRuns), 2)
-
-expect("repeated rows do not double count the opponent",
-       sum(led$OppRuns), 1)
-
-# Order independence: the same rows shuffled must produce the same ledger.
-set.seed(42)
+set.seed(1)
 shuffled <- plays[sample(nrow(plays)), ]
-led_shuffled <- fns$build_run_ledger(shuffled, "100", sched)
-expect("shuffling the rows changes nothing",
-       led_shuffled$FocalRuns, led$FocalRuns)
+expect("row order inside an inning is irrelevant",
+       build_run_ledger(shuffled, "66", sched)$FocalRuns, c(0, 1, 2))
 
-# Dropped rows: the feed sometimes omits the row that "carried" a run. The
-# max-per-inning approach still recovers it, which summing a per-play field
-# would not.
-thinned <- plays[-c(3, 6), ]
-led_thinned <- fns$build_run_ledger(thinned, "100", sched)
-expect("dropping the row that scored still recovers the run",
-       sum(led_thinned$FocalRuns), 2)
+# The feed does not always return every pitch row. Dropping an intermediate
+# row must not lose a run, because the inning maximum is read rather than a
+# row-by-row accumulation. Row 2 is the away team passing through 1 on its
+# way to 2 in the first.
+expect("dropping an intermediate row does not lose a run",
+       build_run_ledger(plays[-2, ], "66", sched)$OppRuns, c(2, 0, 0))
 
-# Away team as the focal team: the same scoreboard, read from the other side.
-sched_away <- data.frame(event_id = "G1", home_away = "away",
+# The one row that cannot go missing is the inning's highest score. That is
+# a real limit of the approach, asserted here so it stays understood: it is
+# why the Data Quality tab reconciles the rebuilt total against the final
+# score rather than trusting it.
+expect("losing an inning's top row does lose that run",
+       sum(build_run_ledger(plays[-9, ], "66", sched)$FocalRuns), 2)
+
+# A mid-inning correction that reads low must not produce a negative run.
+dip <- plays
+dip$home_score[6] <- 0
+expect("a scoreboard that reads low never yields a negative run",
+       any(build_run_ledger(dip, "66", sched)$FocalRuns < 0), FALSE)
+
+# Innings arriving out of order are sorted before differencing.
+expect("out-of-order innings are sorted first",
+       build_run_ledger(plays[rev(seq_len(nrow(plays))), ],
+                        "66", sched)$FocalRuns, c(0, 1, 2))
+
+# -- the other side of the ledger ---------------------------------------
+
+away_sched <- data.frame(event_id = "G1", home_away = "away",
                          stringsAsFactors = FALSE)
-led_away <- fns$build_run_ledger(plays, "100", sched_away)
-expect("the home/away assignment flips the columns",
-       led_away$FocalRuns, c(0, 1, 0))
-expect("and flips the opponent column too",
-       led_away$OppRuns, c(2, 0, 0))
+expect("playing away swaps the two columns",
+       build_run_ledger(plays, "66", away_sched)$FocalRuns, c(2, 0, 0))
 
-# A mid-inning correction that reads LOW must not produce a negative run.
-corrected <- data.frame(
-  game_id       = rep("G1", 4),
-  period_number = c(1, 1, 2, 2),
-  away_score    = c(0, 0, 0, 0),
-  home_score    = c(3, 1, 3, 3),     # 3 then a correction down to 1
-  stringsAsFactors = FALSE
+# -- more than one game --------------------------------------------------
+
+two <- rbind(
+  plays,
+  data.frame(game_id = rep("G2", 3), period_number = c(1, 2, 3),
+             away_score = c(1, 1, 1), home_score = c(0, 0, 4),
+             stringsAsFactors = FALSE)
 )
-led_corrected <- fns$build_run_ledger(corrected, "100", sched)
-expect("a backwards correction never yields negative runs",
-       any(led_corrected$FocalRuns < 0), FALSE)
-expect("the high-water mark is kept",
-       sum(led_corrected$FocalRuns), 3)
+two_sched <- data.frame(event_id = c("G1", "G2"),
+                        home_away = c("home", "home"),
+                        stringsAsFactors = FALSE)
+led2 <- build_run_ledger(two, "66", two_sched)
+expect("games are kept separate", nrow(led2), 6L)
+expect("the second game starts its own running total",
+       led2$FocalRuns[led2$game_id == "G2"], c(0, 0, 4))
 
-# Innings arrive out of order in some feeds. They are sorted explicitly.
-jumbled <- plays[order(-plays$period_number), ]
-led_jumbled <- fns$build_run_ledger(jumbled, "100", sched)
-expect("innings are sorted before differencing",
-       led_jumbled$Inning, c(1, 2, 3))
-expect("and the runs still land correctly",
-       led_jumbled$FocalRuns, c(2, 0, 0))
+# -- degenerate input ----------------------------------------------------
 
-# Degenerate input
 expect("an empty frame yields an empty ledger",
-       nrow(fns$build_run_ledger(plays[0, ], "100", sched)), 0L)
+       nrow(build_run_ledger(plays[0, ], "66", sched)), 0L)
 
-expect("a frame missing the score columns yields an empty ledger",
-       nrow(fns$build_run_ledger(data.frame(game_id = "G1"), "100", sched)), 0L)
+expect("a frame with no score columns yields an empty ledger",
+       nrow(build_run_ledger(plays[, c("game_id", "period_number")],
+                             "66", sched)), 0L)
 
-expect("pre-game rows with no inning are dropped",
-       nrow(fns$build_run_ledger(
-         data.frame(game_id = "G1", period_number = NA_real_,
-                    away_score = 0, home_score = 0), "100", sched)), 0L)
+pregame <- plays
+pregame$period_number <- 0
+expect("rows before the first inning are ignored",
+       nrow(build_run_ledger(pregame, "66", sched)), 0L)

@@ -70,6 +70,14 @@ all 14 matched hitters agree within 10 points on every rate stat.
 Most of the work in this project went into trusting the output, not generating
 it. A few examples:
 
+**It is one file, on purpose.** The whole build is a single `.Rmd` rather than
+a package or a set of sourced scripts. A staff member gets one file, changes
+one line, and knits. Nothing to install, no working directory to set, no
+second file to forget when the report is handed to somebody else. The cost is
+a long file, paid for a report that survives being emailed to a coach. The
+parts worth testing are pulled back out and tested directly, which is what
+`tests/` does.
+
 **Games that fail to download are counted and disclosed.** Every window label in
 the report uses the number of games actually retrieved, not the number
 requested. A report that silently renders on half its data is the main thing this
@@ -110,7 +118,7 @@ rather than the other way around.
 Rscript tests/run-all.R
 ```
 
-99 assertions, no test framework to install, no network. They cover the
+97 assertions, no test framework to install, no network. They cover the
 arithmetic and parsing that the report's conclusions rest on: base-3 innings,
 player identity merging, play attribution, the run ledger, conference
 matching by id, and how missing values render. `tests/README.md` explains
@@ -151,8 +159,11 @@ cannot be knit to PDF directly because it writes its own HTML and CSS. For a
 PDF, knit to HTML, open the file in Chrome, and print to PDF with
 "Background graphics" turned on.
 
-Requires R 4.2 or newer, `rmarkdown`, and `baseballr` 2.0.0 or newer. The
-test suite is run on R 4.3.3. Remaining packages are installed on first run.
+Requires R 4.2 or newer, `rmarkdown`, and `baseballr` 2.0.0 or newer. The UCLA
+example was built on R 4.5.0 with `baseballr` 2.0.0, and the report prints both
+at the bottom of its Data Quality tab, so any render states what produced it.
+The test suite is run on R 4.3.3. Remaining packages are installed on first
+run.
 
 Data pulls are cached in `cache/`, so re-knitting the same opponent is fast.
 That folder is gitignored: it is large, it regenerates on demand, and it is not
@@ -162,7 +173,7 @@ mine to redistribute.
 
 ```
 opponent_advance_report.Rmd   the whole build, one file
-tests/                        99 assertions, run with Rscript tests/run-all.R
+tests/                        97 assertions, run with Rscript tests/run-all.R
 docs/img/                     screenshots used above
 README.md                     this file
 LICENSE                       MIT
