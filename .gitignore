@@ -2,10 +2,9 @@
 # mine to redistribute.
 cache/
 
-# Knitted output. The published example is index.html at the repo root
-# so GitHub Pages can serve it; every other build artifact stays local.
+# Knitted output. The report is published on RPubs, linked from the README,
+# so build artifacts stay local.
 *.html
-!index.html
 *_files/
 *.knit.md
 *.utf8.md
